@@ -1,0 +1,72 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    // ModDevGradle (NeoForge mod development plugin)
+    id 'net.neoforged.moddev' version "${moddevgradle_version}"
+}
+
+group = project.maven_group
+version = project.mod_version
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+}
+
+neoForge {
+    version = project.neoforge_version
+
+    // This add-on is 100% code-side (no data gen needed), but keeping runs is useful for local dev.
+    runs {
+        client {
+            client()
+        }
+        server {
+            server()
+        }
+        data {
+            data()
+        }
+    }
+
+    mods {
+        "${mod_id}" {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+// Expand properties into neoforge.mods.toml
+tasks.named('processResources', ProcessResources).configure {
+    def props = [
+            mod_id              : project.mod_id,
+            mod_name            : project.mod_name,
+            mod_version         : project.mod_version,
+            minecraft_version   : project.minecraft_version,
+            neoforge_version_range: project.neoforge_version_range,
+            roamers_version_range: project.roamers_version_range
+    ]
+    inputs.properties(props)
+    filesMatching('META-INF/neoforge.mods.toml') {
+        expand props
+    }
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            artifactId = project.mod_id
+        }
+    }
+    repositories {
+        // Empty by default. Add if you want to publish.
+    }
+}
