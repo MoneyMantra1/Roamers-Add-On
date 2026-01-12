@@ -432,38 +432,6 @@ public final class RoamersCompat {
         }
         return pulled;
     }
-
-        return maxTake != remaining;
-    }
-
-    private static int pullFromContainerAt(ServerLevel level, BlockPos pos, SimpleContainer targetInv, Item wanted, int maxTake) {
-        if (maxTake <= 0) return 0;
-        BlockEntity be = level.getBlockEntity(pos);
-        if (!(be instanceof Container container)) return 0;
-
-        int pulled = 0;
-        for (int i = 0; i < container.getContainerSize(); i++) {
-            ItemStack stack = container.getItem(i);
-            if (stack.isEmpty() || stack.getItem() != wanted) continue;
-
-            int take = Math.min(maxTake - pulled, stack.getCount());
-            if (take <= 0) break;
-
-            ItemStack removed = container.removeItem(i, take);
-            if (!removed.isEmpty()) {
-                giveToContainer(targetInv, removed);
-                pulled += removed.getCount();
-            }
-
-            if (pulled >= maxTake) break;
-        }
-
-        if (pulled > 0) {
-            container.setChanged();
-        }
-        return pulled;
-    }
-
     // ---------------------- Wood logic ----------------------
 
     public static boolean isWoodDerived(Item item) {
