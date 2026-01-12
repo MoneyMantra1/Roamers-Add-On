@@ -83,14 +83,36 @@ public final class RoamersCompat {
             )
     );
 
+    // Prevent spam-replanting (e.g., multiple logs from the same tree in rapid succession).
+    private static final java.util.Map<java.util.UUID, Long> LAST_REPLANT_TICK = new java.util.concurrent.ConcurrentHashMap<>();
+
+
+
+    
     private static Set<Item> fallbackSaplingsFromRace(Entity roamer) {
         try {
-            Object raceObj = invoke(roamer, "race");
+            // Prefer the Roamers API: AbstractCharacter#getRace()
+            Object raceObj = null;
+            try {
+                raceObj = invoke(roamer, "getRace");
+            } catch (Throwable ignored) {
+            }
+
+            // If race isn't set yet, infer from the current blockpos (AbstractCharacter#getRaceFromBlockPos)
+            if (raceObj == null) {
+                try {
+                    raceObj = invoke(roamer, "getRaceFromBlockPos", roamer.blockPosition());
+                } catch (Throwable ignored) {
+                }
+            }
+
+            if (raceObj == null) return Set.of();
+
             String raceName = null;
             if (raceObj instanceof Enum<?> e) raceName = e.name();
-            else if (raceObj != null) raceName = String.valueOf(raceObj);
+            else raceName = String.valueOf(raceObj);
 
-            if (raceName == null) return Set.of();
+            if (raceName == null || raceName.isBlank()) return Set.of();
 
             List<ResourceLocation> ids = RACE_DEFAULT_SAPLINGS.get(raceName);
             if (ids == null || ids.isEmpty()) return Set.of();
@@ -690,6 +712,12 @@ public final class RoamersCompat {
         return state.is(BlockTags.LOGS);
     }
 
+    public static boolean isLogBlock(BlockState state) {
+        return isLogLike(state);
+    }
+
+
+
     public static Item saplingForLogBlock(BlockState logState) {
         ResourceLocation id = BuiltInRegistries.BLOCK.getKey(logState.getBlock());
         if (id == null) return null;
@@ -786,6 +814,29 @@ public final class RoamersCompat {
                     if (st.getBlock() instanceof SaplingBlock) {
                         tryAdvanceSapling(level, p);
                     }
+
+
+    public static boolean hasAnyLogNearby(ServerLevel level, BlockPos center, int radius) {
+        if (radius <= 0) return false;
+        int cx = center.getX();
+        int cy = center.getY();
+        int cz = center.getZ();
+
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -2; dy <= 4; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos p = new BlockPos(cx + dx, cy + dy, cz + dz);
+                    // Never force-load chunks (avoids server hangs during worldgen/chunk loads)
+                    if (!level.hasChunkAt(p)) continue;
+
+                    BlockState st = level.getBlockState(p);
+                    if (isLogBlock(st)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
                 }
             }
         }
@@ -866,3 +917,78 @@ public final class RoamersCompat {
         return base;
     }
 }
+
+    public static void tryReplantAfterLogBreak(ServerLevel level, Entity roamer, BlockPos brokenPos, BlockState brokenState) {
+        if (level == null || roamer == null || brokenPos == null || brokenState == null) return;
+
+        long now = level.getGameTime();
+        Long last = LAST_REPLANT_TICK.get(roamer.getUUID());
+        if (last != null && (now - last) < 40L) return; // 2 seconds
+
+        Item sapling = saplingForLogBlock(brokenState);
+        if (sapling == null || sapling == Items.AIR) return;
+
+        Object invObj = invoke(roamer, "getInventory");
+        if (!(invObj instanceof SimpleContainer inv)) return;
+
+        if (!containerHas(inv, sapling)) return;
+
+        // Prefer the base area of the tree, but don't force-load chunks.
+        BlockPos base = brokenPos;
+        for (int i = 0; i < 12; i++) {
+            BlockPos below = base.below();
+            if (!level.hasChunkAt(below)) break;
+            if (!isLogBlock(level.getBlockState(below))) break;
+            base = below;
+        }
+
+        // Try a few nearby spots at the same Y as the base log (air above ground).
+        List<BlockPos> candidates = new ArrayList<>();
+        candidates.add(base);
+        candidates.addAll(ringPositions(base, 1));
+        Collections.shuffle(candidates);
+
+        for (BlockPos p : candidates) {
+            if (!level.hasChunkAt(p) || !level.hasChunkAt(p.below())) continue;
+            if (!level.isEmptyBlock(p)) continue;
+            if (!level.getFluidState(p).isEmpty()) continue;
+            if (!level.getBlockState(p.below()).isFaceSturdy(level, p.below(), Direction.UP)) continue;
+
+            if (!removeOne(inv, sapling)) return;
+
+            boolean placed = placeSaplingBlock(level, p, sapling);
+            if (!placed) {
+                // give it back if we couldn't place
+                giveToContainer(inv, new ItemStack(sapling, 1));
+                return;
+            }
+
+            LAST_REPLANT_TICK.put(roamer.getUUID(), now);
+            return;
+        }
+    }
+
+
+
+    public static Item saplingForWantedItem(Item wanted) {
+        if (wanted == null) return null;
+        ResourceLocation id = BuiltInRegistries.ITEM.getKey(wanted);
+        if (id == null) return null;
+        String path = id.getPath();
+
+        // Common vanilla wood prefixes
+        String[] woods = new String[]{
+                "oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "bamboo"
+        };
+
+        for (String w : woods) {
+            if (path.startsWith(w + "_") || path.contains("_" + w + "_") || path.endsWith("_" + w)) {
+                ResourceLocation sap = ResourceLocation.fromNamespaceAndPath("minecraft", w + "_sapling");
+                if (BuiltInRegistries.ITEM.containsKey(sap)) return BuiltInRegistries.ITEM.get(sap);
+            }
+        }
+
+        return null;
+    }
+
+
