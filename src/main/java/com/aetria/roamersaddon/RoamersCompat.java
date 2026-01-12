@@ -426,8 +426,8 @@ public final class RoamersCompat {
                 if (dx * dx + dz * dz > radius * radius) continue;
                 for (int y = yMin; y <= yMax; y++) {
                     BlockPos p = new BlockPos(center.getX() + dx, y, center.getZ() + dz);
-                    if (!level.hasChunkAt(p)) continue;
                     if (preferred != null && preferred.equals(p)) continue;
+                    if (!level.hasChunkAt(p)) continue;
                     remaining -= pullFromContainerAt(level, p, targetInv, wanted, remaining);
                     if (remaining <= 0) return true;
                 }
@@ -439,6 +439,7 @@ public final class RoamersCompat {
 
     private static int pullFromContainerAt(ServerLevel level, BlockPos pos, SimpleContainer targetInv, Item wanted, int maxTake) {
         if (maxTake <= 0) return 0;
+        // Never force-load chunks (prevents server hangs during chunk generation/loading)
         if (!level.hasChunkAt(pos)) return 0;
         BlockEntity be = level.getBlockEntity(pos);
         if (!(be instanceof Container container)) return 0;
@@ -657,6 +658,7 @@ public final class RoamersCompat {
 
     public static boolean placeSaplingBlock(ServerLevel level, BlockPos pos, Item saplingItem) {
         if (!(saplingItem instanceof BlockItem bi)) return false;
+        if (!level.hasChunkAt(pos)) return false;
         Block sapBlock = bi.getBlock();
 
         BlockState place = sapBlock.defaultBlockState();
@@ -757,8 +759,8 @@ public final class RoamersCompat {
                 boolean placed = false;
                 for (int attempts = 0; attempts < ring.size(); attempts++) {
                     BlockPos p = ring.get(ringIdx++ % ring.size());
-                    if (!level.isEmptyBlock(p)) continue;
                     if (!level.hasChunkAt(p)) continue;
+                    if (!level.isEmptyBlock(p)) continue;
                     if (!level.getFluidState(p).isEmpty()) continue;
                     if (!level.getBlockState(p.below()).isFaceSturdy(level, p.below(), Direction.UP)) continue;
 
