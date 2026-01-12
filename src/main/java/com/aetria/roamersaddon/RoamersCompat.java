@@ -404,34 +404,34 @@ public final class RoamersCompat {
 
     // ---------------------- Chest scanning / pulling ----------------------
 
-    public static boolean pullFromNearbyContainers(ServerLevel level,
-                                                  BlockPos center,
-                                                  BlockPos preferred,
-                                                  int radius,
-                                                  SimpleContainer targetInv,
-                                                  Item wanted,
-                                                  int maxTake) {
-        int remaining = maxTake;
+    private static int pullFromContainerAt(ServerLevel level, BlockPos pos, SimpleContainer targetInv, Item wanted, int maxTake) {
+        if (maxTake <= 0) return 0;
 
-        if (preferred != null) {
-            remaining -= pullFromContainerAt(level, preferred, targetInv, wanted, remaining);
-            if (remaining <= 0) return true;
-        }
+        // Never force-load chunks from a Roamer assistance tick. This can deadlock with worldgen / chunk tasks.
+        if (!level.hasChunkAt(pos)) return 0;
 
-        int yMin = center.getY() - 2;
-        int yMax = center.getY() + 2;
+        BlockEntity be = level.getBlockEntity(pos);
+        if (!(be instanceof Container container)) return 0;
 
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                if (dx * dx + dz * dz > radius * radius) continue;
-                for (int y = yMin; y <= yMax; y++) {
-                    BlockPos p = new BlockPos(center.getX() + dx, y, center.getZ() + dz);
-                    if (preferred != null && preferred.equals(p)) continue;
-                    remaining -= pullFromContainerAt(level, p, targetInv, wanted, remaining);
-                    if (remaining <= 0) return true;
-                }
+        int pulled = 0;
+        for (int i = 0; i < container.getContainerSize(); i++) {
+            ItemStack stack = container.getItem(i);
+            if (stack.isEmpty() || stack.getItem() != wanted) continue;
+
+            int take = Math.min(maxTake - pulled, stack.getCount());
+            if (take <= 0) break;
+
+            ItemStack removed = stack.split(take);
+            if (!removed.isEmpty()) {
+                giveToContainer(targetInv, removed);
+                container.setChanged();
+                pulled += take;
             }
+
+            if (pulled >= maxTake) break;
         }
+        return pulled;
+    }
 
         return maxTake != remaining;
     }
@@ -618,6 +618,10 @@ public final class RoamersCompat {
                 if (dx * dx + dz * dz > radius * radius) continue;
                 for (int y = yMin; y <= yMax; y++) {
                     BlockPos p = new BlockPos(center.getX() + dx, y, center.getZ() + dz);
+
+                    // Avoid chunk loads: this is used for "do we have trees around?" checks.
+                    if (!level.hasChunkAt(p)) continue;
+
                     if (level.getBlockState(p).is(BlockTags.LOGS)) return true;
                 }
             }
@@ -654,6 +658,10 @@ public final class RoamersCompat {
 
     public static boolean placeSaplingBlock(ServerLevel level, BlockPos pos, Item saplingItem) {
         if (!(saplingItem instanceof BlockItem bi)) return false;
+
+        // Avoid chunk loads: placement is called from tick hooks.
+        if (!level.hasChunkAt(pos)) return false;
+
         Block sapBlock = bi.getBlock();
 
         BlockState place = sapBlock.defaultBlockState();
@@ -665,6 +673,9 @@ public final class RoamersCompat {
     }
 
     public static void tryAdvanceSapling(ServerLevel level, BlockPos pos) {
+        // Avoid chunk loads: this is called from scan loops/ticks.
+        if (!level.hasChunkAt(pos)) return;
+
         BlockState state = level.getBlockState(pos);
         Block b = state.getBlock();
         if (!(b instanceof SaplingBlock sapling)) return;
@@ -721,6 +732,10 @@ public final class RoamersCompat {
                 if (dx * dx + dz * dz > radius * radius) continue;
                 for (int y = yMin; y <= yMax; y++) {
                     BlockPos p = new BlockPos(center.getX() + dx, y, center.getZ() + dz);
+
+                    // Avoid chunk loads: this runs from a tick handler.
+                    if (!level.hasChunkAt(p)) continue;
+
                     BlockState st = level.getBlockState(p);
                     if (st.getBlock() instanceof SaplingBlock) {
                         tryAdvanceSapling(level, p);
