@@ -404,12 +404,42 @@ public final class RoamersCompat {
 
     // ---------------------- Chest scanning / pulling ----------------------
 
+    public static boolean pullFromNearbyContainers(ServerLevel level,
+                                                  BlockPos center,
+                                                  BlockPos preferred,
+                                                  int radius,
+                                                  SimpleContainer targetInv,
+                                                  Item wanted,
+                                                  int maxTake) {
+        int remaining = maxTake;
+
+        if (preferred != null) {
+            remaining -= pullFromContainerAt(level, preferred, targetInv, wanted, remaining);
+            if (remaining <= 0) return true;
+        }
+
+        int yMin = center.getY() - 2;
+        int yMax = center.getY() + 2;
+
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (dx * dx + dz * dz > radius * radius) continue;
+                for (int y = yMin; y <= yMax; y++) {
+                    BlockPos p = new BlockPos(center.getX() + dx, y, center.getZ() + dz);
+                    if (!level.hasChunkAt(p)) continue;
+                    if (preferred != null && preferred.equals(p)) continue;
+                    remaining -= pullFromContainerAt(level, p, targetInv, wanted, remaining);
+                    if (remaining <= 0) return true;
+                }
+            }
+        }
+
+        return maxTake != remaining;
+    }
+
     private static int pullFromContainerAt(ServerLevel level, BlockPos pos, SimpleContainer targetInv, Item wanted, int maxTake) {
         if (maxTake <= 0) return 0;
-
-        // Never force-load chunks from a Roamer assistance tick. This can deadlock with worldgen / chunk tasks.
         if (!level.hasChunkAt(pos)) return 0;
-
         BlockEntity be = level.getBlockEntity(pos);
         if (!(be instanceof Container container)) return 0;
 
@@ -421,17 +451,21 @@ public final class RoamersCompat {
             int take = Math.min(maxTake - pulled, stack.getCount());
             if (take <= 0) break;
 
-            ItemStack removed = stack.split(take);
+            ItemStack removed = container.removeItem(i, take);
             if (!removed.isEmpty()) {
                 giveToContainer(targetInv, removed);
-                container.setChanged();
-                pulled += take;
+                pulled += removed.getCount();
             }
 
             if (pulled >= maxTake) break;
         }
+
+        if (pulled > 0) {
+            container.setChanged();
+        }
         return pulled;
     }
+
     // ---------------------- Wood logic ----------------------
 
     public static boolean isWoodDerived(Item item) {
@@ -586,10 +620,7 @@ public final class RoamersCompat {
                 if (dx * dx + dz * dz > radius * radius) continue;
                 for (int y = yMin; y <= yMax; y++) {
                     BlockPos p = new BlockPos(center.getX() + dx, y, center.getZ() + dz);
-
-                    // Avoid chunk loads: this is used for "do we have trees around?" checks.
                     if (!level.hasChunkAt(p)) continue;
-
                     if (level.getBlockState(p).is(BlockTags.LOGS)) return true;
                 }
             }
@@ -626,10 +657,6 @@ public final class RoamersCompat {
 
     public static boolean placeSaplingBlock(ServerLevel level, BlockPos pos, Item saplingItem) {
         if (!(saplingItem instanceof BlockItem bi)) return false;
-
-        // Avoid chunk loads: placement is called from tick hooks.
-        if (!level.hasChunkAt(pos)) return false;
-
         Block sapBlock = bi.getBlock();
 
         BlockState place = sapBlock.defaultBlockState();
@@ -641,9 +668,7 @@ public final class RoamersCompat {
     }
 
     public static void tryAdvanceSapling(ServerLevel level, BlockPos pos) {
-        // Avoid chunk loads: this is called from scan loops/ticks.
         if (!level.hasChunkAt(pos)) return;
-
         BlockState state = level.getBlockState(pos);
         Block b = state.getBlock();
         if (!(b instanceof SaplingBlock sapling)) return;
@@ -700,10 +725,7 @@ public final class RoamersCompat {
                 if (dx * dx + dz * dz > radius * radius) continue;
                 for (int y = yMin; y <= yMax; y++) {
                     BlockPos p = new BlockPos(center.getX() + dx, y, center.getZ() + dz);
-
-                    // Avoid chunk loads: this runs from a tick handler.
                     if (!level.hasChunkAt(p)) continue;
-
                     BlockState st = level.getBlockState(p);
                     if (st.getBlock() instanceof SaplingBlock) {
                         tryAdvanceSapling(level, p);
@@ -736,6 +758,7 @@ public final class RoamersCompat {
                 for (int attempts = 0; attempts < ring.size(); attempts++) {
                     BlockPos p = ring.get(ringIdx++ % ring.size());
                     if (!level.isEmptyBlock(p)) continue;
+                    if (!level.hasChunkAt(p)) continue;
                     if (!level.getFluidState(p).isEmpty()) continue;
                     if (!level.getBlockState(p.below()).isFaceSturdy(level, p.below(), Direction.UP)) continue;
 
