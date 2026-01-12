@@ -23,7 +23,7 @@ import static com.aetria.roamersaddon.RoamersAddonMod.LOGGER;
 
 public final class RoamersCompat {
 
-    private static final ResourceLocation ROAMER_ENTITY_ID = new ResourceLocation("roamers", "roamer");
+    private static final ResourceLocation ROAMER_ENTITY_ID = ResourceLocation.fromNamespaceAndPath("roamers", "roamer");
 
     // Suffixes we consider to represent a "wood set" (used to infer saplings)
     private static final List<String> WOOD_SUFFIXES = List.of(
@@ -134,7 +134,7 @@ public final class RoamersCompat {
 
                     // try a few sapling naming conventions in same namespace
                     for (String suffix : SAPLING_SUFFIXES) {
-                        ResourceLocation candidate = new ResourceLocation(blockId.getNamespace(), base + suffix);
+                        ResourceLocation candidate = ResourceLocation.fromNamespaceAndPath(blockId.getNamespace(), base + suffix);
                         if (BuiltInRegistries.ITEM.containsKey(candidate)) {
                             saplingIds.add(candidate);
                             break; // pick the first that exists
