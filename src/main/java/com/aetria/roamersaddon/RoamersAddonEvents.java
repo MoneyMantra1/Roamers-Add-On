@@ -18,23 +18,25 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.block.state.properties.DirectionProperty;
-import net.minecraft.world.level.material.FluidState;
 import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.event.TickEvent;
 import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
-import net.neoforged.neoforge.event.entity.living.LivingDestroyBlockEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
-import net.neoforged.neoforge.event.tick.LevelTickEvent;
+import net.neoforged.neoforge.event.level.BlockEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-import static com.aetria.roamersaddon.RoamersAddonMod.LOGGER;
-
+@Mod.EventBusSubscriber(modid = RoamersAddonMod.MODID)
 public final class RoamersAddonEvents {
+    private static final Logger LOGGER = LoggerFactory.getLogger("RoamersAddon");
 
+    // Persistent flags stored on the Roamer entity
+    private static final String TAG_INIT_DONE = "roamers_addon_init_done";
     private static final String TAG_SPAWN_SAPLINGS_DONE = "roamers_addon_spawn_saplings_done";
     private static final String TAG_STARTKIT_DONE = "roamers_addon_startkit_done";
 
@@ -43,8 +45,10 @@ public final class RoamersAddonEvents {
     private static final String KEY_WANTED_SINCE = "wanted_since";
     private static final String KEY_PITY = "pity";
     private static final String KEY_START_CHEST = "start_chest_pos";
+    private static final String KEY_NEXT_SAPLING_ATTEMPT = "next_sapling_attempt";
 
     private static final int INIT_DELAY_TICKS = 20;                   // 1 second after first seen
+    private static final int SAPLING_RETRY_TICKS = 20 * 5;            // retry giving spawn saplings every 5s until land/buildings are ready
     private static final int AUTO_HELP_AFTER_TICKS = 20 * 60 * 5;     // 5 minutes
     private static final int AUTO_HELP_COOLDOWN_TICKS = 20 * 60 * 5;  // 5 minutes per same "wanted key"
 
@@ -52,10 +56,9 @@ public final class RoamersAddonEvents {
     private static final int GIVE_CRAFT_AMOUNT = 8;
 
     private static final int CHEST_SEARCH_RADIUS = 12;
-    private static final int TREE_SEARCH_RADIUS = 10;
+    private static final int TREE_SEARCH_RADIUS = 16;
 
-    // Track roamers without leaking worlds
-    private final Set<Entity> trackedRoamers = Collections.newSetFromMap(new WeakHashMap<>());
+    private final Set<Entity> trackedRoamers = ConcurrentHashMap.newKeySet();
     private final Map<UUID, Long> pendingInitAtGameTime = new ConcurrentHashMap<>();
 
     // Replant anti-spam (base position -> expireTick)
@@ -76,7 +79,7 @@ public final class RoamersAddonEvents {
     }
 
     @SubscribeEvent
-    public void onLevelTick(LevelTickEvent.Post event) {
+    public void onLevelTick(TickEvent.LevelTickEvent.Post event) {
         Level level = event.getLevel();
         if (!(level instanceof ServerLevel serverLevel)) return;
 
@@ -92,24 +95,34 @@ public final class RoamersAddonEvents {
         List<Entity> snapshot = new ArrayList<>(trackedRoamers);
         for (Entity e : snapshot) {
             if (e == null) continue;
-            if (e.isRemoved()) {
+            if (!e.isAlive()) {
                 trackedRoamers.remove(e);
+                pendingInitAtGameTime.remove(e.getUUID());
                 continue;
             }
-            if (e.level() != serverLevel) continue;
-            if (!RoamersCompat.isRoamerEntity(e)) continue;
 
             UUID id = e.getUUID();
 
-            // 1) Give saplings on spawn (one-time)
-            if (shouldRunPendingInit(e, gameTime)) {
+            // Do one-time init when the delay expires
+            Long initAt = pendingInitAtGameTime.get(id);
+            if (initAt != null && gameTime >= initAt) {
                 try {
-                    applySpawnSaplingsIfNeeded(serverLevel, e);
+                    if (!hasTag(e, TAG_INIT_DONE)) {
+                        applySpawnSaplingsIfNeeded(serverLevel, e, gameTime);
+                        setTag(e, TAG_INIT_DONE);
+                    }
                 } catch (Throwable t) {
-                    LOGGER.error("Failed spawn sapling init for roamer {}", id, t);
+                    LOGGER.error("Init failed for roamer {}", id, t);
                 } finally {
                     pendingInitAtGameTime.remove(id);
                 }
+            }
+
+            // 1) Keep trying to give initial saplings until Roamers has finished setting up Land/buildings
+            try {
+                applySpawnSaplingsIfNeeded(serverLevel, e, gameTime);
+            } catch (Throwable t) {
+                LOGGER.error("Failed spawn-sapling grant for roamer {}", id, t);
             }
 
             // 4 + 2) After Roamer places campfire + crafting table: place protected chest and plant saplings first
@@ -124,92 +137,106 @@ public final class RoamersAddonEvents {
             try {
                 assistWithWantedItems(serverLevel, e, gameTime);
             } catch (Throwable t) {
-                LOGGER.error("Failed assistance tick for roamer {}", id, t);
-            }
-
-            // 3) Consistent pity system with 5 minute cooldown per wanted item
-            try {
-                tickAutoHelp(serverLevel, e, gameTime);
-            } catch (Throwable t) {
-                LOGGER.error("Failed auto-help tick for roamer {}", id, t);
+                LOGGER.error("assistWithWantedItems failed for roamer {}", id, t);
             }
         }
     }
 
     @SubscribeEvent
-    public void onEntityInteract(PlayerInteractEvent.EntityInteract event) {
-        Player player = event.getEntity();
-        if (player.level().isClientSide()) return;
+    public void onInteract(PlayerInteractEvent.EntityInteractSpecific event) {
+        if (event.getLevel().isClientSide()) return;
 
+        Player player = event.getEntity();
         Entity target = event.getTarget();
         if (!RoamersCompat.isRoamerEntity(target)) return;
 
-        InteractionHand hand = event.getHand();
-        ItemStack held = player.getItemInHand(hand);
+        ItemStack held = player.getItemInHand(event.getHand());
         if (!held.is(Items.STICK)) return;
 
-        String msg = buildFriendlyStatusMessage(target);
-        player.sendSystemMessage(Component.literal(msg));
-        event.setCanceled(true);
+        WantedInfo wanted = RoamersCompat.getWantedInfo(target);
+        String activity = RoamersCompat.getActivityName(target);
+
+        Component msg;
+        if (wanted == null || wanted.item() == null) {
+            msg = Component.literal("§aRoamer: §fI'm " + activity + " right now.");
+        } else {
+            String nice = RoamersCompat.niceItemName(wanted.item());
+            switch (wanted.type) {
+                case BUILD -> msg = Component.literal("§aRoamer: §fI'm " + activity + " — I need §e" + nice + "§f to keep building.");
+                case CRAFT -> msg = Component.literal("§aRoamer: §fI'm " + activity + " — I'm trying to craft, but I'm missing §e" + nice + "§f.");
+                default -> msg = Component.literal("§aRoamer: §fI'm " + activity + " — I'm looking for §e" + nice + "§f.");
+            }
+        }
+
+        player.displayClientMessage(msg, false);
         event.setCancellationResult(InteractionResult.SUCCESS);
+        event.setCanceled(true);
     }
 
-    /**
-     * 1) Protect the initial chest from Roamer excavation/breaking.
-     * 5) Replant saplings when Roamers chop logs (best-effort).
-     */
     @SubscribeEvent
-    public void onLivingDestroyBlock(LivingDestroyBlockEvent event) {
-        LivingEntity breaker = event.getEntity();
-        if (breaker == null) return;
-        if (!RoamersCompat.isRoamerEntity(breaker)) return;
-        if (!(breaker.level() instanceof ServerLevel level)) return;
+    public void onBreak(BlockEvent.BreakEvent event) {
+        if (event.getLevel().isClientSide()) return;
 
-        BlockPos pos = event.getPos();
-        BlockState state = event.getState();
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        Entity breaker = event.getPlayer(); // may be null; roamers break via fake player sometimes; handle below
 
-        // Chest protection
-        BlockPos protectedChest = getStartChestPos(breaker);
-        if (protectedChest != null && protectedChest.equals(pos)) {
-            event.setCanceled(true);
-            return;
+        // Chest protection: cancel if a roamer is breaking their own start chest
+        // We handle this via RoamersCompat.shouldCancelChestBreak(...) which checks nearby roamers and their stored chest pos.
+        try {
+            if (RoamersCompat.shouldCancelChestBreak(level, event.getPos(), breaker, this::getStartChestPos)) {
+                event.setCanceled(true);
+                return;
+            }
+        } catch (Throwable t) {
+            // swallow, don't break normal mining
         }
 
-        // Replant after chopping logs
-        if (!RoamersCompat.isLogLike(state)) return;
+        // Replanting: if a roamer broke a log, replant a matching sapling if available
+        try {
+            Entity trueBreaker = RoamersCompat.getTrueBreakerEntity(level, event.getPos(), breaker);
+            if (trueBreaker == null || !RoamersCompat.isRoamerEntity(trueBreaker)) return;
 
-        long gameTime = level.getGameTime();
-        BlockPos plantPos = findTreeBasePlantPos(level, pos);
-        if (plantPos == null) return;
+            BlockPos pos = event.getPos();
+            BlockState state = event.getState();
+            if (!RoamersCompat.isLogBlock(state)) return;
 
-        long key = plantPos.asLong();
-        Long until = recentReplants.get(key);
-        if (until != null && until > gameTime) return;
+            long gameTime = level.getGameTime();
+            BlockPos plantPos = findTreeBasePlantPos(level, pos);
+            if (plantPos == null) return;
 
-        Object invObj = RoamersCompat.invoke(breaker, "getInventory");
-        if (!(invObj instanceof SimpleContainer inv)) return;
+            long key = plantPos.asLong();
+            Long until = recentReplants.get(key);
+            if (until != null && until > gameTime) return;
 
-        Item saplingItem = RoamersCompat.saplingForLogBlock(state);
-        if (saplingItem == null) return;
+            Object invObj = RoamersCompat.invoke(trueBreaker, "getInventory");
+            if (!(invObj instanceof SimpleContainer inv)) return;
 
-        if (!RoamersCompat.removeOne(inv, saplingItem)) return;
+            Item saplingItem = RoamersCompat.saplingForLogBlock(state);
+            if (saplingItem == null) return;
 
-        if (RoamersCompat.placeSaplingBlock(level, plantPos, saplingItem)) {
-            recentReplants.put(key, gameTime + 20L * 30L); // 30s
-            // Optional small growth nudge so they don't stall
-            RoamersCompat.tryAdvanceSapling(level, plantPos);
+            if (!RoamersCompat.removeOne(inv, saplingItem)) return;
+
+            // Delay by 1 tick so the broken block state is fully cleared
+            level.getServer().execute(() -> {
+                if (RoamersCompat.canPlantSaplingAt(level, plantPos)) {
+                    RoamersCompat.placeSaplingItem(level, plantPos, saplingItem);
+                    recentReplants.put(key, gameTime + 20L * 30L); // 30s anti-spam
+                } else {
+                    // put it back
+                    RoamersCompat.giveToContainer(inv, new ItemStack(saplingItem, 1));
+                }
+            });
+        } catch (Throwable t) {
+            // ignore
         }
     }
 
-    private boolean shouldRunPendingInit(Entity roamer, long gameTime) {
-        Long due = pendingInitAtGameTime.get(roamer.getUUID());
-        return due != null && gameTime >= due;
-    }
+    // ---------------------- State helpers ----------------------
 
     private static CompoundTag addonRoot(Entity e) {
-        CompoundTag pd = e.getPersistentData();
-        if (!pd.contains(ROOT)) pd.put(ROOT, new CompoundTag());
-        return pd.getCompound(ROOT);
+        CompoundTag tag = e.getPersistentData();
+        if (!tag.contains(ROOT)) tag.put(ROOT, new CompoundTag());
+        return tag.getCompound(ROOT);
     }
 
     private static boolean hasTag(Entity e, String key) {
@@ -231,20 +258,35 @@ public final class RoamersAddonEvents {
         addonRoot(roamer).putLong(KEY_START_CHEST, pos.asLong());
     }
 
-    private void applySpawnSaplingsIfNeeded(ServerLevel level, Entity roamer) {
+    private void applySpawnSaplingsIfNeeded(ServerLevel level, Entity roamer, long gameTime) {
         if (hasTag(roamer, TAG_SPAWN_SAPLINGS_DONE)) return;
 
+        // Roamers' Land/buildings can be initialized a bit after spawn. Keep retrying (cheaply) until ready.
+        CompoundTag root = addonRoot(roamer);
+        long nextTry = root.getLong(KEY_NEXT_SAPLING_ATTEMPT);
+        if (nextTry != 0L && gameTime < nextTry) return;
+        root.putLong(KEY_NEXT_SAPLING_ATTEMPT, gameTime + SAPLING_RETRY_TICKS);
+
         Set<Item> saplings = RoamersCompat.findSaplingsForRoamerStructures(roamer);
-        if (saplings.isEmpty()) return;
+        if (saplings == null || saplings.isEmpty()) return;
 
         Object invObj = RoamersCompat.invoke(roamer, "getInventory");
         if (!(invObj instanceof SimpleContainer inv)) return;
 
+        boolean gaveAny = false;
         for (Item sapling : saplings) {
-            RoamersCompat.giveToContainer(inv, new ItemStack(sapling, 8));
+            int have = RoamersCompat.count(inv, sapling);
+            int want = 8;
+            if (have >= want) continue;
+
+            RoamersCompat.giveToContainer(inv, new ItemStack(sapling, want - have));
+            gaveAny = true;
         }
 
-        setTag(roamer, TAG_SPAWN_SAPLINGS_DONE);
+        if (gaveAny) {
+            setTag(roamer, TAG_SPAWN_SAPLINGS_DONE);
+            root.remove(KEY_NEXT_SAPLING_ATTEMPT);
+        }
     }
 
     /**
@@ -272,6 +314,9 @@ public final class RoamersAddonEvents {
         placeChest(level, chestPos);
         setStartChestPos(roamer, chestPos);
 
+        // Ensure they actually have the saplings we inferred before we try to plant them.
+        applySpawnSaplingsIfNeeded(level, roamer, gameTime);
+
         // 2) plant saplings around camp BEFORE they get deep into building
         // Plant at least 1 of every sapling variant currently carried
         RoamersCompat.plantSaplingsInRing(level, campfirePos, inv, 1);
@@ -279,7 +324,7 @@ public final class RoamersAddonEvents {
         // Also plant extra of the wood types used for structures (best effort)
         Set<Item> neededSaplings = RoamersCompat.findSaplingsForRoamerStructures(roamer);
         if (!neededSaplings.isEmpty()) {
-            RoamersCompat.plantSpecificSaplingsInRing(level, campfirePos, inv, neededSaplings, 3);
+            RoamersCompat.plantSpecificSaplingsInRing(level, campfirePos, inv, neededSaplings, 1);
         }
 
         // small growth nudge so they don't stall on "no trees"
@@ -308,193 +353,96 @@ public final class RoamersAddonEvents {
             return;
         }
 
-        // 4) If it's a wood-derived item, try crafting it from resources they already have.
-        if (RoamersCompat.isWoodDerived(wanted.item())) {
-            boolean crafted = RoamersCompat.tryCraftWoodDerived(inv, wanted.item());
-            if (crafted) {
-                RoamersCompat.refreshAI(roamer);
-                return;
-            }
-
-            // 2) Ensure saplings exist near camp if they have them (so trees can exist early).
-            BlockPos campfirePos = RoamersCompat.findBuildStartPos(roamer, "CAMPFIRE");
-            BlockPos plantCenter = campfirePos != null ? campfirePos : roamer.blockPosition();
-
-            // If there are no logs nearby, plant saplings and nudge growth.
-            if (!RoamersCompat.hasAnyLogsNearby(level, plantCenter, TREE_SEARCH_RADIUS)) {
-                RoamersCompat.plantSaplingsInRing(level, plantCenter, inv, 2);
-                RoamersCompat.tryAdvanceSaplingsNear(level, plantCenter, 6);
-                RoamersCompat.refreshAI(roamer);
-                return;
-            }
-
-            // If logs exist nearby but they're stalling, force a mining refresh for the wood base.
-            Item logItem = RoamersCompat.bestLogForWoodDerived(wanted.item());
-            if (logItem != null) {
-                RoamersCompat.forceMineForItem(roamer, logItem);
-            } else {
-                RoamersCompat.refreshAI(roamer);
-            }
+        // If it's wood-derived and they have saplings, make sure trees exist (plant near if possible)
+        if (RoamersCompat.isWoodDerivedItem(wanted.item())) {
+            BlockPos center = roamer.blockPosition();
+            RoamersCompat.ensureSomeSaplingsPlanted(level, center, inv, 2);
+            RoamersCompat.tryAdvanceSaplingsNear(level, center, 6);
         }
+
+        // 3) Pity system: if they've wanted the same thing for 5 minutes, give it (repeatable per-item cooldown)
+        tickPityGive(level, roamer, inv, wanted, gameTime);
     }
 
-    /**
-     * 3) Pity system that works consistently:
-     * - Track "wanted key" + sinceTick
-     * - Give after 5 minutes stuck
-     * - Repeatable every 5 minutes per same wanted key
-     */
-    private void tickAutoHelp(ServerLevel level, Entity roamer, long gameTime) {
-        WantedInfo wanted = RoamersCompat.getWantedInfo(roamer);
-        if (wanted == null) {
-            // clear current wanted tracking
-            CompoundTag root = addonRoot(roamer);
-            root.remove(KEY_WANTED);
-            root.remove(KEY_WANTED_SINCE);
+    private void tickPityGive(ServerLevel level, Entity roamer, SimpleContainer inv, WantedInfo wanted, long gameTime) {
+        String wantedKey = wanted.type + ":" + RoamersCompat.idOfItem(wanted.item());
+        CompoundTag root = addonRoot(roamer);
+
+        String prevKey = root.getString(KEY_WANTED);
+        long since = root.getLong(KEY_WANTED_SINCE);
+        if (!wantedKey.equals(prevKey)) {
+            root.putString(KEY_WANTED, wantedKey);
+            root.putLong(KEY_WANTED_SINCE, gameTime);
             return;
         }
 
-        CompoundTag root = addonRoot(roamer);
-
-        String currentKey = root.getString(KEY_WANTED);
-        if (!wanted.key().equals(currentKey)) {
-            root.putString(KEY_WANTED, wanted.key());
+        if (since == 0L) {
             root.putLong(KEY_WANTED_SINCE, gameTime);
+            return;
         }
 
-        long since = root.getLong(KEY_WANTED_SINCE);
-        long age = gameTime - since;
-        if (age < AUTO_HELP_AFTER_TICKS) return;
+        long waited = gameTime - since;
+        if (waited < AUTO_HELP_AFTER_TICKS) return;
 
-        Object invObj = RoamersCompat.invoke(roamer, "getInventory");
-        if (!(invObj instanceof SimpleContainer inv)) return;
-
-        // If they already have at least one, don't hand out more.
-        if (RoamersCompat.containerHas(inv, wanted.item())) return;
-
-        // Per-key cooldown so it keeps working reliably.
+        // per-item cooldown
         CompoundTag pity = root.getCompound(KEY_PITY);
-        String safeKey = wanted.key().replace(':', '_').replace('/', '_');
-        long lastGave = pity.getLong(safeKey);
-        if (lastGave > 0L && (gameTime - lastGave) < AUTO_HELP_COOLDOWN_TICKS) return;
+        long last = pity.getLong(wantedKey);
+        if (last != 0L && (gameTime - last) < AUTO_HELP_COOLDOWN_TICKS) return;
 
-        int amount = wanted.type == WantedType.BUILD ? GIVE_BUILD_AMOUNT : GIVE_CRAFT_AMOUNT;
-        ItemStack stack = new ItemStack(wanted.item(), amount);
-        RoamersCompat.giveToContainer(inv, stack);
-
-        pity.putLong(safeKey, gameTime);
+        int amount = (wanted.type == WantedType.BUILD) ? GIVE_BUILD_AMOUNT : GIVE_CRAFT_AMOUNT;
+        RoamersCompat.giveToContainer(inv, new ItemStack(wanted.item(), amount));
+        pity.putLong(wantedKey, gameTime);
         root.put(KEY_PITY, pity);
+
+        // reset timer so it can repeat again if they get stuck again later
+        root.putLong(KEY_WANTED_SINCE, gameTime);
 
         RoamersCompat.refreshAI(roamer);
     }
 
-    private static BlockPos findSafeChestPos(ServerLevel level, BlockPos campfirePos, BlockPos craftingPos) {
-        // Prefer a spot a few blocks away from the camp area so excavation doesn't immediately hit it.
-        int dx = craftingPos.getX() - campfirePos.getX();
-        int dz = craftingPos.getZ() - campfirePos.getZ();
-        Direction away;
-        if (Math.abs(dx) > Math.abs(dz)) {
-            away = dx >= 0 ? Direction.EAST : Direction.WEST;
-        } else {
-            away = dz >= 0 ? Direction.SOUTH : Direction.NORTH;
-        }
+    // ---------------------- Wanted model ----------------------
 
-        BlockPos preferred = craftingPos.relative(away, 4);
+    public enum WantedType { BUILD, CRAFT, OTHER }
 
-        // search a small ring around preferred
-        for (int r = 0; r <= 3; r++) {
-            for (Direction d : Direction.Plane.HORIZONTAL) {
-                BlockPos p = preferred.relative(d, r);
-                if (p.distManhattan(campfirePos) <= 2) continue;
-                if (p.distManhattan(craftingPos) <= 2) continue;
-                BlockPos adjusted = findSurfaceSpot(level, p);
-                if (adjusted != null && isGoodChestSpot(level, adjusted)) return adjusted;
-            }
-        }
+    public record WantedInfo(Item item, WantedType type) {}
 
-        // fall back: scan around crafting at distance 4
+    // ---------------------- Utility ----------------------
+
+    private static BlockPos findSafeChestPos(ServerLevel level, BlockPos campfire, BlockPos crafting) {
+        // Prefer a spot a few blocks away from campfire to avoid excavation
+        BlockPos base = campfire;
         for (Direction d : Direction.Plane.HORIZONTAL) {
-            BlockPos p = craftingPos.relative(d, 4);
-            BlockPos adjusted = findSurfaceSpot(level, p);
-            if (adjusted != null && isGoodChestSpot(level, adjusted)) return adjusted;
+            BlockPos p = base.relative(d, 4);
+            if (canPlaceChestAt(level, p)) return p;
         }
-
-        return null;
-    }
-
-    private static BlockPos findSurfaceSpot(ServerLevel level, BlockPos pos) {
-        // Try to nudge the Y to a good spot (avoid floating chests)
-        BlockPos.MutableBlockPos m = pos.mutable();
-        // Search downward first
-        for (int i = 0; i < 6; i++) {
-            if (isGoodChestSpot(level, m)) return m.immutable();
-            m.move(Direction.DOWN);
-        }
-        // Then upward
-        m.set(pos);
-        for (int i = 0; i < 6; i++) {
-            if (isGoodChestSpot(level, m)) return m.immutable();
-            m.move(Direction.UP);
+        for (Direction d : Direction.Plane.HORIZONTAL) {
+            BlockPos p = crafting.relative(d, 4);
+            if (canPlaceChestAt(level, p)) return p;
         }
         return null;
     }
 
-    private static boolean isGoodChestSpot(ServerLevel level, BlockPos pos) {
-        if (!level.isEmptyBlock(pos)) return false;
-
-        BlockPos below = pos.below();
-        BlockState belowState = level.getBlockState(below);
-        if (!belowState.isFaceSturdy(level, below, Direction.UP)) return false;
-
-        FluidState fluid = level.getFluidState(pos);
-        return fluid.isEmpty();
+    private static boolean canPlaceChestAt(ServerLevel level, BlockPos pos) {
+        BlockState state = level.getBlockState(pos);
+        return state.isAir() || state.getMaterial().isReplaceable();
     }
 
     private static void placeChest(ServerLevel level, BlockPos pos) {
-        BlockState state = Blocks.CHEST.defaultBlockState();
-        DirectionProperty facingProp = ChestBlock.FACING;
-        if (state.hasProperty(facingProp)) {
-            state = state.setValue(facingProp, Direction.NORTH);
-        }
-        level.setBlockAndUpdate(pos, state);
+        if (!canPlaceChestAt(level, pos)) return;
+        level.setBlockAndUpdate(pos, Blocks.CHEST.defaultBlockState());
     }
 
-    @SuppressWarnings("SameReturnValue")
     private static BlockPos findTreeBasePlantPos(ServerLevel level, BlockPos brokenLogPos) {
-        // Plant where the base log was (or would be) if the ground supports it.
-        BlockPos.MutableBlockPos m = brokenLogPos.mutable();
+        BlockPos p = brokenLogPos;
 
-        // Walk down through any logs/air until ground.
+        // Walk down to find the base (first non-log below)
         for (int i = 0; i < 12; i++) {
-            BlockState below = level.getBlockState(m.below());
-            if (!RoamersCompat.isLogLike(below)) {
-                // try plant at current position if air and below supports
-                BlockPos plant = m.immutable();
-                if (!level.isEmptyBlock(plant)) return null;
-                if (!below.isFaceSturdy(level, m.below(), Direction.UP)) return null;
-                return plant;
-            }
-            m.move(Direction.DOWN);
-        }
-        return null;
-    }
-
-    private static String buildFriendlyStatusMessage(Entity roamer) {
-        String activity = RoamersCompat.getActivityName(roamer);
-        WantedInfo wanted = RoamersCompat.getWantedInfo(roamer);
-
-        if (wanted == null) {
-            return "Roamer: I'm currently busy (" + activity + ").";
+            BlockState below = level.getBlockState(p.below());
+            if (!RoamersCompat.isLogBlock(below)) break;
+            p = p.below();
         }
 
-        String itemName = wanted.item().getDescription().getString();
-        return switch (wanted.type) {
-            case BUILD -> "Roamer: I'm " + activity + " — I'm missing " + itemName + " to keep building.";
-            case CRAFT -> "Roamer: I'm " + activity + " — I'm trying to craft something, but I need " + itemName + ".";
-        };
+        // Plant at the first non-log position (where the base log was)
+        return p;
     }
-
-    enum WantedType { BUILD, CRAFT }
-
-    record WantedInfo(WantedType type, Item item, String key) { }
 }
