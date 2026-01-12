@@ -112,7 +112,16 @@ public final class RoamersAddonEvents {
                 LOGGER.error("Failed start-kit placement for roamer {}", id, t);
             }
 
-            // 2) Auto-provide missing item after 5 minutes of looking
+            
+            // 1b) If they are stuck wanting wood-derived items and there are no trees/logs nearby,
+            // proactively plant the right saplings (and nudge growth) so they can craft instead of idling.
+            try {
+                tickWoodSupport(serverLevel, e, state, gameTime);
+            } catch (Throwable t) {
+                LOGGER.error("Failed wood-support tick for roamer {}", id, t);
+            }
+
+// 2) Auto-provide missing item after 5 minutes of looking
             try {
                 tickAutoHelp(serverLevel, e, state, gameTime);
             } catch (Throwable t) {
@@ -139,6 +148,45 @@ public final class RoamersAddonEvents {
         event.setCancellationResult(InteractionResult.SUCCESS);
     }
 
+    @SubscribeEvent
+    public void onBlockBreak(net.neoforged.neoforge.event.level.BlockEvent.BreakEvent event) {
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+
+        // Only attribute replanting to Roamers when the breaker is a FakePlayer (Roamers uses fake interactions).
+        if (!(event.getPlayer() instanceof net.neoforged.neoforge.common.util.FakePlayer)) return;
+
+        BlockPos pos = event.getPos();
+        BlockState state = event.getState();
+        if (!RoamersCompat.isLogBlock(state)) return;
+
+        // Find the nearest Roamer to this break position.
+        net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(pos).inflate(5.0);
+        List<Entity> nearby = level.getEntitiesOfClass(Entity.class, box, RoamersCompat::isRoamerEntity);
+        if (nearby.isEmpty()) return;
+
+        Entity closest = null;
+        double best = Double.MAX_VALUE;
+        for (Entity e : nearby) {
+            double d = e.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+            if (d < best) {
+                best = d;
+                closest = e;
+            }
+        }
+        if (closest == null) return;
+
+        // Schedule for next tick (after the log is actually removed) to avoid placement failures.
+        level.getServer().execute(() -> {
+            try {
+                RoamersCompat.tryReplantAfterLogBreak(level, closest, pos, state);
+            } catch (Throwable t) {
+                LOGGER.error("Failed replant after log break at {}", pos, t);
+            }
+        });
+    }
+
+
+
     private boolean shouldRunPendingInit(Entity roamer, long gameTime) {
         Long due = pendingInitAtGameTime.get(roamer.getUUID());
         return due != null && gameTime >= due;
@@ -157,15 +205,34 @@ public final class RoamersAddonEvents {
         persistentData(e).putBoolean(key, true);
     }
 
+    
     private void applySpawnSaplingsIfNeeded(ServerLevel level, Entity roamer) {
         if (hasTag(roamer, TAG_SPAWN_SAPLINGS_DONE)) return;
 
         // Figure out which saplings match the wood types used in the Roamer's structures.
+        // IMPORTANT: this must work immediately on spawn (before Land/buildings are selected),
+        // so RoamersCompat includes a Race-based fallback.
         Set<Item> saplings = RoamersCompat.findSaplingsForRoamerStructures(roamer);
-        if (saplings.isEmpty()) {
-            // Not fatal; it just means we couldn't infer anything yet.
-            return;
+        if (saplings == null || saplings.isEmpty()) {
+            // Last-resort fallback (should be rare): Plains defaults.
+            saplings = new LinkedHashSet<>();
+            saplings.add(Items.OAK_SAPLING);
+            saplings.add(Items.BIRCH_SAPLING);
         }
+
+        Object invObj = RoamersCompat.invoke(roamer, "getInventory");
+        if (!(invObj instanceof net.minecraft.world.SimpleContainer inv)) return;
+
+        // Top up to 8 of each sapling (don't spam-stack every restart).
+        for (Item sapling : saplings) {
+            int have = RoamersCompat.count(inv, sapling);
+            int want = 8;
+            if (have >= want) continue;
+            RoamersCompat.giveToContainer(inv, new ItemStack(sapling, want - have));
+        }
+
+        setTag(roamer, TAG_SPAWN_SAPLINGS_DONE);
+    }
 
         Object invObj = RoamersCompat.invoke(roamer, "getInventory");
         if (!(invObj instanceof net.minecraft.world.SimpleContainer inv)) return;
@@ -194,21 +261,26 @@ public final class RoamersAddonEvents {
 
         placeChest(level, chestPos);
 
-        // Drop 1 of each sapling variant the roamer currently carries (remove from inventory if possible)
+        
+        // Ensure saplings exist in inventory before we try to plant them.
+        applySpawnSaplingsIfNeeded(level, roamer);
+
         Object invObj = RoamersCompat.invoke(roamer, "getInventory");
         if (invObj instanceof net.minecraft.world.SimpleContainer inv) {
-            List<Item> saplingItems = RoamersCompat.listSaplingVariantsInContainer(inv);
-            for (Item sapling : saplingItems) {
-                if (RoamersCompat.removeOne(inv, sapling)) {
-                    spawnItem(level, chestPos, new ItemStack(sapling, 1));
-                } else {
-                    // If we couldn't remove, still drop 1 to satisfy the feature
-                    spawnItem(level, chestPos, new ItemStack(sapling, 1));
-                }
+            // Plant saplings immediately around camp (prioritize the wood-types needed for structures).
+            Set<Item> neededSaplings = RoamersCompat.findSaplingsForRoamerStructures(roamer);
+            if (neededSaplings != null && !neededSaplings.isEmpty()) {
+                // Plant 2 of each needed type first (so they can produce wood quickly)
+                RoamersCompat.plantSpecificSaplingsInRing(level, campfirePos, inv, neededSaplings, 2);
             }
-        }
 
-        setTag(roamer, TAG_STARTKIT_DONE);
+            // Then plant 1 of any other sapling variants they carry.
+            RoamersCompat.plantSaplingsInRing(level, campfirePos, inv, 1);
+
+            // Nudge nearby saplings so they don't stall on "no trees"
+            RoamersCompat.tryAdvanceSaplingsNear(level, campfirePos, 6);
+        }
+setTag(roamer, TAG_STARTKIT_DONE);
     }
 
     private void tickAutoHelp(ServerLevel level, Entity roamer, RoamerState state, long gameTime) {
@@ -241,6 +313,67 @@ public final class RoamersAddonEvents {
 
         state.lastGaveKey = wanted.key();
     }
+
+    private void tickWoodSupport(ServerLevel level, Entity roamer, RoamerState state, long gameTime) {
+        WantedInfo wanted = RoamersCompat.getWantedInfo(roamer);
+        if (wanted == null || wanted.item() == null) return;
+
+        // Don't run constantly - prevent spam planting
+        if (state.lastWoodAssistTick != 0L && (gameTime - state.lastWoodAssistTick) < 200L) return; // 10s
+
+        ResourceLocation id = BuiltInRegistries.ITEM.getKey(wanted.item());
+        if (id == null) return;
+
+        if (!isWoodRelatedPath(id.getPath())) return;
+
+        Object invObj = RoamersCompat.invoke(roamer, "getInventory");
+        if (!(invObj instanceof net.minecraft.world.SimpleContainer inv)) return;
+
+        BlockPos center = roamer.blockPosition();
+
+        // If there are already logs nearby, let them chop/craft normally.
+        if (RoamersCompat.hasAnyLogNearby(level, center, 10)) return;
+
+        Set<Item> toPlant = new LinkedHashSet<>();
+        Item specific = RoamersCompat.saplingForWantedItem(wanted.item());
+        if (specific != null && specific != Items.AIR) {
+            toPlant.add(specific);
+        } else {
+            Set<Item> inferred = RoamersCompat.findSaplingsForRoamerStructures(roamer);
+            if (inferred != null) toPlant.addAll(inferred);
+        }
+
+        if (toPlant.isEmpty()) return;
+
+        // Plant 2 of each needed type and nudge growth.
+        RoamersCompat.plantSpecificSaplingsInRing(level, center, inv, toPlant, 2);
+        RoamersCompat.tryAdvanceSaplingsNear(level, center, 6);
+
+        state.lastWoodAssistTick = gameTime;
+    }
+
+    private static boolean isWoodRelatedPath(String path) {
+        if (path == null) return false;
+        // Typical build/craft needs that should trigger "plant trees"
+        return path.contains("plank")
+                || path.contains("slab")
+                || path.contains("stairs")
+                || path.contains("fence")
+                || path.contains("gate")
+                || path.contains("log")
+                || path.contains("wood")
+                || path.contains("door")
+                || path.contains("trapdoor")
+                || path.contains("button")
+                || path.contains("pressure_plate")
+                || path.contains("sign")
+                || path.contains("hanging_sign")
+                || path.contains("boat")
+                || path.contains("chest")
+                || path.contains("barrel");
+    }
+
+
 
     private static BlockPos findNearbyChestPos(ServerLevel level, BlockPos near) {
         for (Direction dir : Direction.Plane.HORIZONTAL) {
@@ -306,14 +439,17 @@ public final class RoamersAddonEvents {
         long firstSeenTick = 0L;
         String lastGaveKey = null;
 
+        long lastWoodAssistTick = 0L;
+
         void clear() {
             lastWantedKey = null;
             firstSeenTick = 0L;
             lastGaveKey = null;
+            lastWoodAssistTick = 0L;
         }
     }
 
-    enum WantedType { BUILD, CRAFT }
+enum WantedType { BUILD, CRAFT }
 
     record WantedInfo(WantedType type, Item item, String key) { }
 }
