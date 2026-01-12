@@ -46,7 +46,7 @@ public final class RoamersAddonEvents {
     private static final String KEY_NEXT_SAPLING_ATTEMPT = "next_sapling_attempt";
 
     private static final int INIT_DELAY_TICKS = 20;                   // 1 second after first seen
-    private static final int SAPLING_RETRY_TICKS = 20 * 5;            // retry giving spawn saplings every 5s until Land/buildings are ready
+    private static final int SAPLING_RETRY_TICKS = 20 * 5;            // retry giving spawn saplings every 5 seconds until structures are ready
     private static final int AUTO_HELP_AFTER_TICKS = 20 * 60 * 5;     // 5 minutes
     private static final int AUTO_HELP_COOLDOWN_TICKS = 20 * 60 * 5;  // 5 minutes per same "wanted key"
 
@@ -106,7 +106,7 @@ public final class RoamersAddonEvents {
             // 1) Give saplings on spawn (one-time)
             if (shouldRunPendingInit(e, gameTime)) {
                 try {
-                    applySpawnSaplingsIfNeeded(serverLevel, e);
+                    applySpawnSaplingsIfNeeded(serverLevel, e, gameTime, true);
                 } catch (Throwable t) {
                     LOGGER.error("Failed spawn sapling init for roamer {}", id, t);
                 } finally {
@@ -114,9 +114,9 @@ public final class RoamersAddonEvents {
                 }
             }
 
-            // 1b) Retry sapling grant until Roamers has finished setting up Land/buildings
+            // Keep retrying spawn saplings (Roamers may initialize structure data a few seconds after spawn)
             try {
-                maybeRetrySpawnSaplings(serverLevel, e, gameTime);
+                applySpawnSaplingsIfNeeded(serverLevel, e, gameTime, false);
             } catch (Throwable t) {
                 LOGGER.error("Failed spawn sapling retry for roamer {}", id, t);
             }
@@ -240,22 +240,17 @@ public final class RoamersAddonEvents {
         addonRoot(roamer).putLong(KEY_START_CHEST, pos.asLong());
     }
 
-    
-    private void maybeRetrySpawnSaplings(ServerLevel level, Entity roamer, long gameTime) {
+        private void applySpawnSaplingsIfNeeded(ServerLevel level, Entity roamer, long gameTime, boolean forceNow) {
         if (hasTag(roamer, TAG_SPAWN_SAPLINGS_DONE)) return;
 
+        // Roamers can finish initializing Land/structure data a few seconds after spawn.
+        // Throttle attempts so we don't spam reflection every tick.
         CompoundTag root = addonRoot(roamer);
-        long nextTry = root.getLong(KEY_NEXT_SAPLING_ATTEMPT);
-        if (nextTry != 0L && gameTime < nextTry) return;
-
-        // schedule next attempt before doing any heavier reflection work
+        if (!forceNow) {
+            long nextTry = root.getLong(KEY_NEXT_SAPLING_ATTEMPT);
+            if (nextTry != 0L && gameTime < nextTry) return;
+        }
         root.putLong(KEY_NEXT_SAPLING_ATTEMPT, gameTime + SAPLING_RETRY_TICKS);
-
-        applySpawnSaplingsIfNeeded(level, roamer);
-    }
-
-    private void applySpawnSaplingsIfNeeded(ServerLevel level, Entity roamer) {
-        if (hasTag(roamer, TAG_SPAWN_SAPLINGS_DONE)) return;
 
         Set<Item> saplings = RoamersCompat.findSaplingsForRoamerStructures(roamer);
         if (saplings.isEmpty()) return;
@@ -263,21 +258,17 @@ public final class RoamersAddonEvents {
         Object invObj = RoamersCompat.invoke(roamer, "getInventory");
         if (!(invObj instanceof SimpleContainer inv)) return;
 
-        boolean gaveAny = false;
         for (Item sapling : saplings) {
             int have = RoamersCompat.count(inv, sapling);
-            int want = 8;
-            if (have >= want) continue;
-
-            RoamersCompat.giveToContainer(inv, new ItemStack(sapling, want - have));
-            gaveAny = true;
+            if (have >= 8) continue;
+            RoamersCompat.giveToContainer(inv, new ItemStack(sapling, 8 - have));
         }
 
-        if (gaveAny) {
-            setTag(roamer, TAG_SPAWN_SAPLINGS_DONE);
-            addonRoot(roamer).remove(KEY_NEXT_SAPLING_ATTEMPT);
-        }
+        // Mark done once we successfully infer saplings + see an inventory.
+        setTag(roamer, TAG_SPAWN_SAPLINGS_DONE);
+        root.remove(KEY_NEXT_SAPLING_ATTEMPT);
     }
+
 
     /**
      * Start kit:
@@ -304,8 +295,8 @@ public final class RoamersAddonEvents {
         placeChest(level, chestPos);
         setStartChestPos(roamer, chestPos);
 
-        // Ensure the Roamer actually has the saplings we inferred before we try to plant them.
-        applySpawnSaplingsIfNeeded(level, roamer);
+        // Ensure the Roamer actually has the inferred saplings before we try to plant them
+        applySpawnSaplingsIfNeeded(level, roamer, gameTime, true);
 
         // 2) plant saplings around camp BEFORE they get deep into building
         // Plant at least 1 of every sapling variant currently carried
@@ -532,8 +523,4 @@ public final class RoamersAddonEvents {
     enum WantedType { BUILD, CRAFT }
 
     record WantedInfo(WantedType type, Item item, String key) { }
-}
-
-        return p;
-    }
 }
