@@ -18,6 +18,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.BonemealableBlock;
 import net.minecraft.world.level.block.SaplingBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -71,6 +72,17 @@ public final class RoamersCompat {
                     ResourceLocation.fromNamespaceAndPath("minecraft", "acacia_sapling"),
                     ResourceLocation.fromNamespaceAndPath("minecraft", "oak_sapling")
             ),
+			"DESERT", List.of(
+					ResourceLocation.fromNamespaceAndPath("minecraft", "acacia_sapling"),
+					ResourceLocation.fromNamespaceAndPath("minecraft", "oak_sapling")
+			),
+			"BADLANDS", List.of(
+					ResourceLocation.fromNamespaceAndPath("minecraft", "acacia_sapling"),
+					ResourceLocation.fromNamespaceAndPath("minecraft", "oak_sapling")
+			),
+			"ARTIC", List.of(
+					ResourceLocation.fromNamespaceAndPath("minecraft", "spruce_sapling")
+			),
             "JUNGLE", List.of(
                     ResourceLocation.fromNamespaceAndPath("minecraft", "jungle_sapling"),
                     ResourceLocation.fromNamespaceAndPath("minecraft", "oak_sapling")
@@ -80,7 +92,11 @@ public final class RoamersCompat {
             ),
             "CHERRY", List.of(
                     ResourceLocation.fromNamespaceAndPath("minecraft", "cherry_sapling")
-            )
+			),
+			"CAVE", List.of(
+					ResourceLocation.fromNamespaceAndPath("minecraft", "oak_sapling"),
+					ResourceLocation.fromNamespaceAndPath("minecraft", "spruce_sapling")
+			)
     );
 
     private static Set<Item> fallbackSaplingsFromRace(Entity roamer) {
@@ -276,6 +292,37 @@ public final class RoamersCompat {
             return null;
         } catch (Throwable t) {
             return null;
+        }
+    }
+
+    /**
+     * Best-effort discovery of all build "startPos" values currently known to the Roamer's Land.
+     * Used to avoid planting saplings inside the active build footprint.
+     */
+    public static List<BlockPos> getAllBuildStartPositions(Entity roamer) {
+        try {
+            Object land = invoke(roamer, "getLand");
+            if (land == null) return List.of();
+
+            Class<?> buildTypeCls = Class.forName("net.caitie.roamers.entity.ai.building.Land$BuildType");
+            Method valuesM = buildTypeCls.getMethod("values");
+            Object arr = valuesM.invoke(null);
+            if (!(arr instanceof Object[] vals)) return List.of();
+
+            Method getBuild = land.getClass().getMethod("getBuild", buildTypeCls);
+
+            List<BlockPos> out = new ArrayList<>();
+            for (Object buildType : vals) {
+                Object pairObj = getBuild.invoke(land, buildType);
+                if (!(pairObj instanceof Pair<?, ?> pair)) continue;
+                Object dataObj = pair.getFirst();
+                if (dataObj == null) continue;
+                Object startPosObj = getField(dataObj, "startPos");
+                if (startPosObj instanceof BlockPos pos) out.add(pos);
+            }
+            return out;
+        } catch (Throwable t) {
+            return List.of();
         }
     }
 
@@ -552,6 +599,28 @@ public final class RoamersCompat {
         return null;
     }
 
+    /**
+     * Given a wood-derived "wanted" item (e.g. birch_slab), return the matching sapling-like item (e.g. birch_sapling).
+     * This is best-effort and strictly namespace-aware.
+     */
+    public static Item saplingForWoodDerived(Item wanted) {
+        ResourceLocation id = BuiltInRegistries.ITEM.getKey(wanted);
+        if (id == null) return null;
+
+        String base = extractWoodBase(id.getPath());
+        if (base == null) return null;
+        base = stripKnownPrefixes(base);
+
+        for (String suf : SAPLING_SUFFIXES) {
+            ResourceLocation cand = ResourceLocation.fromNamespaceAndPath(id.getNamespace(), base + suf);
+            if (BuiltInRegistries.ITEM.containsKey(cand)) {
+                Item it = BuiltInRegistries.ITEM.get(cand);
+                return (it == null || it == Items.AIR) ? null : it;
+            }
+        }
+        return null;
+    }
+
     public static boolean tryCraftWoodDerived(SimpleContainer inv, Item wanted) {
         ResourceLocation id = BuiltInRegistries.ITEM.getKey(wanted);
         if (id == null) return false;
@@ -725,6 +794,13 @@ public final class RoamersCompat {
         return true;
     }
 
+    /** Returns true if the world contains exactly the given sapling block at the given position. */
+    public static boolean isExactSaplingAt(ServerLevel level, BlockPos pos, Item saplingItem) {
+        if (!(saplingItem instanceof BlockItem bi)) return false;
+        Block expected = bi.getBlock();
+        return level.getBlockState(pos).is(expected);
+    }
+
     public static void tryAdvanceSapling(ServerLevel level, BlockPos pos) {
         BlockState state = level.getBlockState(pos);
         Block b = state.getBlock();
@@ -753,6 +829,26 @@ public final class RoamersCompat {
             m.invoke(sapling, level, pos, state, rnd);
         } catch (Throwable ignored) {
             // best-effort
+        }
+    }
+
+    /**
+     * Apply a single bonemeal-style growth attempt at the given position.
+     * Returns true if the block accepted bonemeal and a growth tick was performed.
+     */
+    public static boolean tryBonemealAt(ServerLevel level, BlockPos pos, RandomSource rnd) {
+        BlockState state = level.getBlockState(pos);
+        Block b = state.getBlock();
+        if (!(b instanceof BonemealableBlock bonemealable)) return false;
+        try {
+            if (!bonemealable.isValidBonemealTarget(level, pos, state)) return false;
+            if (!bonemealable.isBonemealSuccess(level, rnd, pos, state)) return false;
+            bonemealable.performBonemeal(level, rnd, pos, state);
+            // particle effect (same as vanilla bonemeal)
+            level.levelEvent(1505, pos, 0);
+            return true;
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -832,6 +928,114 @@ public final class RoamersCompat {
                 planted++;
             }
         }
+    }
+
+    /**
+     * Scatter-plant saplings around a center point within a square range, while avoiding a set of "build" positions.
+     *
+     * Planting strategy:
+     * - Pass 1: try to plant at least 1 of each type (fairness)
+     * - Pass 2..goalPerType: round-robin additional plants
+     * - Stop once maxTotal is reached
+     *
+     * Returns a map of sapling item -> planted block positions (only positions that were successfully placed).
+     */
+    public static Map<Item, List<BlockPos>> plantSpecificSaplingsScattered(ServerLevel level,
+                                                                           BlockPos center,
+                                                                           SimpleContainer inv,
+                                                                           Set<Item> saplings,
+                                                                           int goalPerType,
+                                                                           int maxTotal,
+                                                                           int range,
+                                                                           Collection<BlockPos> avoid,
+                                                                           int avoidRadius) {
+        if (saplings == null || saplings.isEmpty()) return Map.of();
+        if (goalPerType <= 0 || maxTotal <= 0 || range <= 0) return Map.of();
+
+        List<Item> types = new ArrayList<>(new LinkedHashSet<>(saplings));
+        if (types.isEmpty()) return Map.of();
+
+        RandomSource rnd = levelRandom(level);
+        Map<Item, List<BlockPos>> planted = new LinkedHashMap<>();
+        List<BlockPos> allPlanted = new ArrayList<>();
+
+        int total = 0;
+        for (int pass = 0; pass < goalPerType; pass++) {
+            for (Item sapling : types) {
+                if (total >= maxTotal) break;
+                if (count(inv, sapling) <= 0) continue;
+
+                BlockPos placed = tryScatterPlace(level, center, sapling, range, rnd, avoid, avoidRadius, allPlanted);
+                if (placed == null) continue;
+
+                // consume from inventory only after successful placement
+                if (!removeOne(inv, sapling)) {
+                    // should not happen, but fail safe: remove the placed block if we couldn't pay the cost
+                    level.removeBlock(placed, false);
+                    continue;
+                }
+
+                planted.computeIfAbsent(sapling, k -> new ArrayList<>()).add(placed);
+                allPlanted.add(placed);
+                total++;
+            }
+            if (total >= maxTotal) break;
+        }
+
+        return planted;
+    }
+
+    private static BlockPos tryScatterPlace(ServerLevel level,
+                                           BlockPos center,
+                                           Item saplingItem,
+                                           int range,
+                                           RandomSource rnd,
+                                           Collection<BlockPos> avoid,
+                                           int avoidRadius,
+                                           List<BlockPos> alreadyPlanted) {
+        final int maxAttempts = 120;
+        final int minSpacingSq = 9; // >=3 blocks apart
+        final int avoidSq = avoidRadius * avoidRadius;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            int dx = rnd.nextInt(range * 2 + 1) - range;
+            int dz = rnd.nextInt(range * 2 + 1) - range;
+
+            int x = center.getX() + dx;
+            int z = center.getZ() + dz;
+
+            // Try a few nearby Y-levels around the center to find a valid sapling spot.
+            for (int dy = 2; dy >= -3; dy--) {
+                BlockPos pos = new BlockPos(x, center.getY() + dy, z);
+
+                if (!level.hasChunkAt(pos)) continue;
+                if (!level.getFluidState(pos).isEmpty()) continue;
+
+                if (avoid != null && !avoid.isEmpty()) {
+                    boolean tooClose = false;
+                    for (BlockPos a : avoid) {
+                        if (a == null) continue;
+                        if (a.distSqr(pos) <= avoidSq) {
+                            tooClose = true;
+                            break;
+                        }
+                    }
+                    if (tooClose) continue;
+                }
+
+                boolean spacingOk = true;
+                for (BlockPos other : alreadyPlanted) {
+                    if (other.distSqr(pos) < minSpacingSq) {
+                        spacingOk = false;
+                        break;
+                    }
+                }
+                if (!spacingOk) continue;
+
+                if (placeSaplingBlock(level, pos, saplingItem)) return pos;
+            }
+        }
+        return null;
     }
 
     private static List<BlockPos> ringPositions(BlockPos center, int r) {
