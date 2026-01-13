@@ -42,12 +42,24 @@ import static com.aetria.roamersaddon.RoamersAddonMod.LOGGER;
 public final class RoamersAddonEvents {
 
     private static final String TAG_SPAWN_SAPLINGS_DONE = "roamers_addon_spawn_saplings_done";
+    private static final String TAG_SPAWN_PLANT_DONE = "roamers_addon_spawn_plant_done";
     private static final String TAG_STARTKIT_DONE = "roamers_addon_startkit_done";
 
-    private static final int INIT_DELAY_TICKS = 20;      // 1 second after first seen
+    private static final int INIT_DELAY_TICKS = 60;      // 3 seconds after first seen (gives Roamers time to pick buildings/materials)
     private static final int AUTO_HELP_AFTER_TICKS = 20 * 60 * 5; // 5 minutes
     private static final int GIVE_BUILD_AMOUNT = 16;
     private static final int GIVE_CRAFT_AMOUNT = 8;
+
+    // Tree self-sufficiency tuning
+    private static final int SPAWN_SAPLINGS_PER_TYPE = 8;
+    private static final int SPAWN_BONEMEAL = 64;
+    private static final int SPAWN_PLANT_GOAL_PER_TYPE = 3;
+    private static final int SPAWN_PLANT_MAX_TOTAL = 24;
+    private static final int SPAWN_PLANT_RANGE = 20; // 40x40 square (20 blocks each direction)
+    private static final int BUILD_AVOID_RADIUS = 8;
+    private static final int WOOD_HELP_CHECK_INTERVAL_TICKS = 20 * 10; // every 10 seconds at most
+    private static final int WOOD_LOG_SCAN_RADIUS = 10;
+    private static final int BONEMEAL_ATTEMPTS_PER_SECOND = 4;
 
     // Track per-roamer state without holding strong refs to entities
     private final Set<Entity> trackedRoamers = Collections.newSetFromMap(new WeakHashMap<>());
@@ -97,7 +109,7 @@ public final class RoamersAddonEvents {
             // 1) Spawn saplings (one-time)
             if (shouldRunPendingInit(e, gameTime)) {
                 try {
-                    applySpawnSaplingsIfNeeded(serverLevel, e);
+                    applySpawnSaplingsIfNeeded(serverLevel, e, state);
                 } catch (Throwable t) {
                     LOGGER.error("Failed spawn sapling init for roamer {}", id, t);
                 } finally {
@@ -114,6 +126,9 @@ public final class RoamersAddonEvents {
 
             // 2) Auto-provide missing item after 5 minutes of looking
             try {
+                // 1/4) Wood self-sufficiency: plant + (optionally) bonemeal saplings when wood-derived items are blocking progress.
+                tickWoodSelfSufficiency(serverLevel, e, state, gameTime);
+
                 tickAutoHelp(serverLevel, e, state, gameTime);
             } catch (Throwable t) {
                 LOGGER.error("Failed auto-help tick for roamer {}", id, t);
@@ -157,24 +172,60 @@ public final class RoamersAddonEvents {
         persistentData(e).putBoolean(key, true);
     }
 
-    private void applySpawnSaplingsIfNeeded(ServerLevel level, Entity roamer) {
-        if (hasTag(roamer, TAG_SPAWN_SAPLINGS_DONE)) return;
+    private void applySpawnSaplingsIfNeeded(ServerLevel level, Entity roamer, RoamerState state) {
+        // Step 1: ensure they START with enough saplings + bonemeal.
+        if (!hasTag(roamer, TAG_SPAWN_SAPLINGS_DONE)) {
+            // Figure out which saplings match the wood types used in the Roamer's structures.
+            Set<Item> saplings = RoamersCompat.findSaplingsForRoamerStructures(roamer);
+            if (saplings.isEmpty()) {
+                // Not fatal; it just means we couldn't infer anything yet.
+                return;
+            }
 
-        // Figure out which saplings match the wood types used in the Roamer's structures.
-        Set<Item> saplings = RoamersCompat.findSaplingsForRoamerStructures(roamer);
-        if (saplings.isEmpty()) {
-            // Not fatal; it just means we couldn't infer anything yet.
-            return;
+            Object invObj = RoamersCompat.invoke(roamer, "getInventory");
+            if (!(invObj instanceof net.minecraft.world.SimpleContainer inv)) return;
+
+            for (Item sapling : saplings) {
+                RoamersCompat.giveToContainer(inv, new ItemStack(sapling, SPAWN_SAPLINGS_PER_TYPE));
+            }
+            RoamersCompat.giveToContainer(inv, new ItemStack(Items.BONE_MEAL, SPAWN_BONEMEAL));
+
+            // Remember the inferred saplings for later (wood self-sufficiency)
+            state.spawnSaplings = saplings;
+
+            setTag(roamer, TAG_SPAWN_SAPLINGS_DONE);
         }
+
+        // Step 2: plant a balanced mix once, outside the build footprint.
+        if (hasTag(roamer, TAG_SPAWN_PLANT_DONE)) return;
 
         Object invObj = RoamersCompat.invoke(roamer, "getInventory");
         if (!(invObj instanceof net.minecraft.world.SimpleContainer inv)) return;
 
-        for (Item sapling : saplings) {
-            RoamersCompat.giveToContainer(inv, new ItemStack(sapling, 8));
+        Set<Item> saplings = state.spawnSaplings != null ? state.spawnSaplings : RoamersCompat.findSaplingsForRoamerStructures(roamer);
+        if (saplings.isEmpty()) return;
+
+        List<BlockPos> buildStarts = RoamersCompat.getAllBuildStartPositions(roamer);
+        BlockPos center = RoamersCompat.findBuildStartPos(roamer, "CRAFTING_TABLE");
+        if (center == null) center = roamer.blockPosition();
+
+        Map<Item, List<BlockPos>> planted = RoamersCompat.plantSpecificSaplingsScattered(
+                level,
+                center,
+                inv,
+                saplings,
+                SPAWN_PLANT_GOAL_PER_TYPE,
+                SPAWN_PLANT_MAX_TOTAL,
+                SPAWN_PLANT_RANGE,
+                buildStarts,
+                BUILD_AVOID_RADIUS
+        );
+
+        if (!planted.isEmpty()) {
+            state.recordPlanted(planted);
         }
 
-        setTag(roamer, TAG_SPAWN_SAPLINGS_DONE);
+        setTag(roamer, TAG_SPAWN_PLANT_DONE);
     }
 
     private void tryPlaceStartKitIfReady(ServerLevel level, Entity roamer) {
@@ -242,6 +293,103 @@ public final class RoamersAddonEvents {
         state.lastGaveKey = wanted.key();
     }
 
+    /**
+     * Reduce reliance on the "pity" system for wood-derived needs by making sapling placement + growth proactive.
+     *
+     * Design goals:
+     * - Keep CPU impact low (runs 1x/sec, only does work when a wood-derived item is blocking progress)
+     * - Never spam plant/bonemeal attempts (cooldowns + small caps)
+     */
+    private void tickWoodSelfSufficiency(ServerLevel level, Entity roamer, RoamerState state, long gameTime) {
+        WantedInfo wanted = RoamersCompat.getWantedInfo(roamer);
+        if (wanted == null) return;
+        if (!RoamersCompat.isWoodDerived(wanted.item())) return;
+
+        Object invObj = RoamersCompat.invoke(roamer, "getInventory");
+        if (!(invObj instanceof net.minecraft.world.SimpleContainer inv)) return;
+
+        // If they already have it, nothing to do.
+        if (RoamersCompat.containerHas(inv, wanted.item())) return;
+
+        boolean didSomething = false;
+
+        // If they have the materials in-inventory, craft (planks/slabs/stairs/etc) instead of idling.
+        if (RoamersCompat.tryCraftWoodDerived(inv, wanted.item())) {
+            didSomething = true;
+        }
+
+        Item neededSapling = RoamersCompat.saplingForWoodDerived(wanted.item());
+        if (neededSapling == null) {
+            if (didSomething) RoamersCompat.refreshAI(roamer);
+            return;
+        }
+
+        // Keep a small set of tracked saplings we planted, so we can bonemeal them without scanning the world.
+        state.pruneSaplingPositions(level, neededSapling);
+
+        // If we have no tracked saplings and no nearby logs, plant 1 (rate-limited).
+        if (gameTime >= state.nextWoodHelpTick
+                && state.getSaplingPositions(neededSapling).isEmpty()
+                && RoamersCompat.count(inv, neededSapling) > 0
+                && !RoamersCompat.hasAnyLogsNearby(level, roamer.blockPosition(), WOOD_LOG_SCAN_RADIUS)) {
+
+            List<BlockPos> buildStarts = RoamersCompat.getAllBuildStartPositions(roamer);
+            BlockPos center = RoamersCompat.findBuildStartPos(roamer, "CRAFTING_TABLE");
+            if (center == null) center = roamer.blockPosition();
+
+            Map<Item, List<BlockPos>> planted = RoamersCompat.plantSpecificSaplingsScattered(
+                    level,
+                    center,
+                    inv,
+                    Set.of(neededSapling),
+                    1,
+                    1,
+                    SPAWN_PLANT_RANGE,
+                    buildStarts,
+                    BUILD_AVOID_RADIUS
+            );
+            if (!planted.isEmpty()) {
+                state.recordPlanted(planted);
+                didSomething = true;
+            }
+
+            state.nextWoodHelpTick = gameTime + WOOD_HELP_CHECK_INTERVAL_TICKS;
+        }
+
+        // Bonemeal a few tracked saplings to accelerate growth.
+        if (RoamersCompat.count(inv, Items.BONE_MEAL) > 0) {
+            List<BlockPos> positions = new ArrayList<>(state.getSaplingPositions(neededSapling));
+            if (!positions.isEmpty()) {
+                int attempts = Math.min(BONEMEAL_ATTEMPTS_PER_SECOND, RoamersCompat.count(inv, Items.BONE_MEAL));
+                for (BlockPos pos : positions) {
+                    if (attempts <= 0) break;
+
+                    // If it already grew or got replaced, stop tracking it.
+                    if (!RoamersCompat.isExactSaplingAt(level, pos, neededSapling)) {
+                        state.removeSaplingPos(neededSapling, pos);
+                        continue;
+                    }
+
+                    if (RoamersCompat.tryBonemealAt(level, pos, level.getRandom())) {
+                        if (RoamersCompat.removeOne(inv, Items.BONE_MEAL)) {
+                            attempts--;
+                        }
+                        didSomething = true;
+                    }
+
+                    // If it grew from bonemeal, it won't be a sapling anymore.
+                    if (!RoamersCompat.isExactSaplingAt(level, pos, neededSapling)) {
+                        state.removeSaplingPos(neededSapling, pos);
+                    }
+                }
+            }
+        }
+
+        if (didSomething) {
+            RoamersCompat.refreshAI(roamer);
+        }
+    }
+
     private static BlockPos findNearbyChestPos(ServerLevel level, BlockPos near) {
         for (Direction dir : Direction.Plane.HORIZONTAL) {
             BlockPos p = near.relative(dir);
@@ -306,10 +454,50 @@ public final class RoamersAddonEvents {
         long firstSeenTick = 0L;
         String lastGaveKey = null;
 
+        // Cached spawn inference
+        Set<Item> spawnSaplings = null;
+
+        // Saplings this add-on planted (per sapling type), used to target bonemeal without scanning large areas.
+        private final Map<Item, Set<BlockPos>> plantedSaplings = new HashMap<>();
+
+        // Rate-limit extra planting attempts while stuck on wood-derived needs
+        long nextWoodHelpTick = 0L;
+
         void clear() {
             lastWantedKey = null;
             firstSeenTick = 0L;
             lastGaveKey = null;
+        }
+
+        void recordPlanted(Map<Item, List<BlockPos>> planted) {
+            for (Map.Entry<Item, List<BlockPos>> e : planted.entrySet()) {
+                if (e.getKey() == null || e.getValue() == null) continue;
+                plantedSaplings.computeIfAbsent(e.getKey(), k -> new LinkedHashSet<>()).addAll(e.getValue());
+            }
+        }
+
+        Set<BlockPos> getSaplingPositions(Item sapling) {
+            return plantedSaplings.getOrDefault(sapling, Collections.emptySet());
+        }
+
+        void removeSaplingPos(Item sapling, BlockPos pos) {
+            Set<BlockPos> set = plantedSaplings.get(sapling);
+            if (set == null) return;
+            set.remove(pos);
+            if (set.isEmpty()) plantedSaplings.remove(sapling);
+        }
+
+        void pruneSaplingPositions(ServerLevel level, Item sapling) {
+            Set<BlockPos> set = plantedSaplings.get(sapling);
+            if (set == null || set.isEmpty()) return;
+            // Copy to avoid concurrent modification
+            List<BlockPos> copy = new ArrayList<>(set);
+            for (BlockPos pos : copy) {
+                if (!RoamersCompat.isExactSaplingAt(level, pos, sapling)) {
+                    set.remove(pos);
+                }
+            }
+            if (set.isEmpty()) plantedSaplings.remove(sapling);
         }
     }
 
