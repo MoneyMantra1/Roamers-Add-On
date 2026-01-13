@@ -755,6 +755,73 @@ public final class RoamersCompat {
         return false;
     }
 
+    /**
+     * Returns true if we can see logs for the wood family corresponding to the given sapling.
+     * This is stricter than {@link #hasAnyLogsNearby} and avoids false positives (e.g., oak logs nearby
+     * when the Roamer actually needs birch).
+     */
+    public static boolean hasLogsNearbyForSapling(ServerLevel level, BlockPos center, int radius, Item saplingItem) {
+        Block targetLog = logBlockForSapling(saplingItem);
+        int yMin = center.getY() - 4;
+        int yMax = center.getY() + 4;
+
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (dx * dx + dz * dz > radius * radius) continue;
+                for (int y = yMin; y <= yMax; y++) {
+                    BlockPos p = new BlockPos(center.getX() + dx, y, center.getZ() + dz);
+                    BlockState st = level.getBlockState(p);
+                    if (targetLog != null) {
+                        if (st.is(targetLog)) return true;
+                    } else {
+                        if (st.is(BlockTags.LOGS)) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static Block logBlockForSapling(Item saplingItem) {
+        ResourceLocation id = BuiltInRegistries.ITEM.getKey(saplingItem);
+        if (id == null) return null;
+
+        String path = id.getPath();
+        String base = null;
+        for (String suf : SAPLING_SUFFIXES) {
+            if (path.endsWith(suf)) {
+                base = path.substring(0, path.length() - suf.length());
+                break;
+            }
+        }
+        if (base == null || base.isEmpty()) return null;
+
+        // Prefer overworld logs, but support nether stems as well.
+        List<String> candidates = List.of(base + "_log", base + "_stem");
+        for (String c : candidates) {
+            ResourceLocation blockId = ResourceLocation.fromNamespaceAndPath(id.getNamespace(), c);
+            if (BuiltInRegistries.BLOCK.containsKey(blockId)) {
+                Block b = BuiltInRegistries.BLOCK.get(blockId);
+                if (b != null) return b;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Cheap, conservative check to avoid planting/tracking saplings in obviously hopeless spots
+     * (e.g., directly under a solid ceiling). Leaves and non-solid replaceables are allowed.
+     */
+    public static boolean isSaplingSpotLikelyGrowable(ServerLevel level, BlockPos saplingPos) {
+        BlockPos above = saplingPos.above();
+        if (!level.hasChunkAt(above)) return true; // don't be strict across chunk edges
+        BlockState st = level.getBlockState(above);
+        if (st.isAir()) return true;
+        if (st.is(BlockTags.LEAVES)) return true;
+        if (st.canBeReplaced()) return true;
+        return st.getCollisionShape(level, above).isEmpty();
+    }
+
     public static boolean isLogLike(BlockState state) {
         return state.is(BlockTags.LOGS);
     }
@@ -789,6 +856,9 @@ public final class RoamersCompat {
         BlockState place = sapBlock.defaultBlockState();
         if (!level.isEmptyBlock(pos)) return false;
         if (!place.canSurvive(level, pos)) return false;
+
+        // Avoid placing saplings in obviously bad spots (e.g., under solid ceilings).
+        if (!isSaplingSpotLikelyGrowable(level, pos)) return false;
 
         level.setBlockAndUpdate(pos, place);
         return true;
