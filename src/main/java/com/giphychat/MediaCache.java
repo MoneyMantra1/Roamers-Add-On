@@ -44,6 +44,14 @@ public class MediaCache {
         }
     }
 
+    public void evict(String url) {
+        Path path = pathForUrl(url);
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+        }
+    }
+
     public void put(String url, byte[] bytes) {
         Path path = pathForUrl(url);
         Path temp = path.resolveSibling(path.getFileName() + ".tmp");

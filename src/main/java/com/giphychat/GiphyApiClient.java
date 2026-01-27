@@ -29,8 +29,6 @@ public class GiphyApiClient implements AutoCloseable {
     private static final String CLIENT_KEY = "giphychat-mod";
     // Minimum interval between API requests (~100 req/min)
     private static final long MIN_REQUEST_INTERVAL_MS = 650;
-    private static final String API_BASE = "https://api.giphy.com/v1/gifs";
-    private static final String GIPHY_API_KEY = "LJtnaehSNSU08kmDSQTlrC0IzU3wnLhi";
 
     private final ExecutorService executor = Executors.newFixedThreadPool(4, runnable -> {
         Thread thread = new Thread(runnable, "GiphyChat-Api");

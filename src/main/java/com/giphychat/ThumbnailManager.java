@@ -82,14 +82,32 @@ public class ThumbnailManager implements AutoCloseable {
     private NativeImage loadImage(String url) {
         try {
             Optional<byte[]> cached = cache.get(url);
-            byte[] bytes = cached.orElseGet(() -> download(url));
+            byte[] bytes;
+            if (cached.isPresent()) {
+                bytes = cached.get();
+                if (isWebP(bytes)) {
+                    LOGGER.warn("Cached thumbnail is WebP, re-downloading: {}", url);
+                    cache.evict(url);
+                    bytes = download(url);
+                }
+            } else {
+                bytes = download(url);
+            }
             if (bytes == null) {
+                LOGGER.warn("Thumbnail download returned no data for {}", url);
                 return null;
             }
             if (isWebP(bytes)) {
                 LOGGER.warn("Thumbnail is WebP (unsupported by NativeImage): {}", url);
                 return null;
             }
+            if (bytes.length < 4) {
+                LOGGER.warn("Thumbnail data too small ({} bytes) for {}", bytes.length, url);
+                return null;
+            }
+            LOGGER.debug("Decoding thumbnail: {} bytes, sig={}{}{}{} for {}", bytes.length,
+                    (char) (bytes[0] & 0xFF), (char) (bytes[1] & 0xFF),
+                    (char) (bytes[2] & 0xFF), (char) (bytes[3] & 0xFF), url);
             return NativeImage.read(new ByteArrayInputStream(bytes));
         } catch (IOException e) {
             LOGGER.warn("Failed to decode thumbnail image from {}: {}", url, e.getMessage());
@@ -101,19 +119,24 @@ public class ThumbnailManager implements AutoCloseable {
         try {
             HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                     .timeout(Duration.ofSeconds(10))
-                    .header("Accept", "image/gif, image/png, image/jpeg, */*")
+                    .header("Accept", "image/gif, image/png, image/jpeg")
                     .header("User-Agent", "GiphyChat/1.0")
                     .GET()
                     .build();
             HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            String contentType = response.headers().firstValue("Content-Type").orElse("unknown");
+            LOGGER.debug("Thumbnail HTTP {} Content-Type={} size={} for {}",
+                    response.statusCode(), contentType, response.body() != null ? response.body().length : 0, url);
             if (response.statusCode() != 200) {
-                LOGGER.warn("Thumbnail download returned HTTP {} for {}", response.statusCode(), url);
+                LOGGER.warn("Thumbnail download returned HTTP {} (Content-Type={}) for {}", response.statusCode(), contentType, url);
                 return null;
             }
             byte[] bytes = response.body();
-            if (bytes != null && bytes.length > 0) {
-                cache.put(url, bytes);
+            if (bytes == null || bytes.length == 0) {
+                LOGGER.warn("Thumbnail download returned empty body for {}", url);
+                return null;
             }
+            cache.put(url, bytes);
             return bytes;
         } catch (IOException | InterruptedException e) {
             LOGGER.warn("Thumbnail download failed for {}: {}", url, e.getMessage());
