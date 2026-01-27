@@ -51,6 +51,36 @@ public class ThumbnailManager implements AutoCloseable {
         this.cache = cache;
     }
 
+    /**
+     * Request an animated GIF for the given URL. Downloads the GIF bytes
+     * (or reads from cache), extracts frames on a background thread, then
+     * registers textures on the render thread and invokes the callback.
+     */
+    public void requestAnimatedGif(String url, Consumer<AnimatedGif> callback) {
+        if (failed.contains(url)) {
+            return;
+        }
+        CompletableFuture.supplyAsync(() -> {
+            Optional<byte[]> cached = cache.get(url);
+            byte[] bytes = cached.orElseGet(() -> download(url));
+            if (bytes == null || isWebP(bytes)) {
+                return null;
+            }
+            return bytes;
+        }, executor).thenAcceptAsync(bytes -> {
+            if (bytes == null) {
+                return;
+            }
+            // Must register textures on the render thread
+            Minecraft.getInstance().execute(() -> {
+                AnimatedGif anim = AnimatedGif.fromGifBytes(bytes, GiphyChatMod.MOD_ID + "/anim/" + url.hashCode());
+                if (anim != null) {
+                    callback.accept(anim);
+                }
+            });
+        }, executor);
+    }
+
     public void requestThumbnail(String url, Consumer<ResourceLocation> callback) {
         ResourceLocation existing = textures.get(url);
         if (existing != null) {

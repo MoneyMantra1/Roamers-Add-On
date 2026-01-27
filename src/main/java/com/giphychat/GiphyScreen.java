@@ -31,6 +31,12 @@ public class GiphyScreen extends Screen {
     private final ThumbnailManager thumbnailManager;
     private final Map<String, ResourceLocation> thumbnails = new ConcurrentHashMap<>();
 
+    // Hover animation state: only the hovered thumbnail plays as animated GIF
+    private String hoveredUrl = null;
+    private String animatingUrl = null;
+    private boolean animationLoading = false;
+    private AnimatedGif currentAnimation = null;
+
     private EditBox searchField;
     private Button searchButton;
     private Button trendingButton;
@@ -91,8 +97,18 @@ public class GiphyScreen extends Screen {
         if (currentRequest != null) {
             currentRequest.cancel(true);
         }
+        releaseAnimation();
         apiClient.close();
         thumbnailManager.close();
+    }
+
+    private void releaseAnimation() {
+        if (currentAnimation != null) {
+            currentAnimation.close();
+            currentAnimation = null;
+        }
+        animatingUrl = null;
+        animationLoading = false;
     }
 
     @Override
@@ -151,6 +167,32 @@ public class GiphyScreen extends Screen {
         int startIndex = Math.max(0, scrollOffset / rowHeight * columns);
         int endIndex = Math.min(results.size(), startIndex + ((gridHeight / rowHeight) + 2) * columns);
 
+        // Determine which thumbnail the cursor is hovering over
+        GiphyResult hovered = findResultAt(mouseX, mouseY);
+        String newHoveredUrl = hovered != null ? hovered.thumbnailUrl() : null;
+
+        // If hover changed, release the old animation and start loading the new one
+        if (!java.util.Objects.equals(newHoveredUrl, hoveredUrl)) {
+            hoveredUrl = newHoveredUrl;
+            if (!java.util.Objects.equals(hoveredUrl, animatingUrl)) {
+                releaseAnimation();
+                if (hoveredUrl != null) {
+                    animationLoading = true;
+                    String urlToLoad = hoveredUrl;
+                    thumbnailManager.requestAnimatedGif(urlToLoad, anim -> {
+                        // Only accept if still hovering the same URL
+                        if (java.util.Objects.equals(urlToLoad, hoveredUrl)) {
+                            currentAnimation = anim;
+                            animatingUrl = urlToLoad;
+                            animationLoading = false;
+                        } else {
+                            anim.close();
+                        }
+                    });
+                }
+            }
+        }
+
         for (int i = startIndex; i < endIndex; i++) {
             GiphyResult result = results.get(i);
             int row = i / columns;
@@ -160,12 +202,22 @@ public class GiphyScreen extends Screen {
             if (y + THUMB_SIZE < gridTop || y > gridBottom) {
                 continue;
             }
-            ResourceLocation texture = thumbnails.get(result.thumbnailUrl());
-            if (texture == null) {
-                thumbnailManager.requestThumbnail(result.thumbnailUrl(), location -> thumbnails.put(result.thumbnailUrl(), location));
-                graphics.fill(x, y, x + THUMB_SIZE, y + THUMB_SIZE, 0xFF2B2B2B);
+
+            // Use animated frame if this is the hovered+loaded thumbnail
+            boolean useAnimation = currentAnimation != null
+                    && result.thumbnailUrl().equals(animatingUrl);
+
+            if (useAnimation) {
+                ResourceLocation frame = currentAnimation.currentFrame();
+                graphics.blit(frame, x, y, 0, 0, THUMB_SIZE, THUMB_SIZE, THUMB_SIZE, THUMB_SIZE);
             } else {
-                graphics.blit(texture, x, y, 0, 0, THUMB_SIZE, THUMB_SIZE, THUMB_SIZE, THUMB_SIZE);
+                ResourceLocation texture = thumbnails.get(result.thumbnailUrl());
+                if (texture == null) {
+                    thumbnailManager.requestThumbnail(result.thumbnailUrl(), location -> thumbnails.put(result.thumbnailUrl(), location));
+                    graphics.fill(x, y, x + THUMB_SIZE, y + THUMB_SIZE, 0xFF2B2B2B);
+                } else {
+                    graphics.blit(texture, x, y, 0, 0, THUMB_SIZE, THUMB_SIZE, THUMB_SIZE, THUMB_SIZE);
+                }
             }
         }
 
