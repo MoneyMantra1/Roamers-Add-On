@@ -29,11 +29,13 @@ public class ThumbnailManager implements AutoCloseable {
     });
     private final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
+            .followRedirects(HttpClient.Redirect.NORMAL)
             .executor(executor)
             .build();
     private final MediaCache cache;
     private final Map<String, ResourceLocation> textures = new ConcurrentHashMap<>();
     private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
+    private final Set<String> failed = ConcurrentHashMap.newKeySet();
 
     public ThumbnailManager(MediaCache cache) {
         this.cache = cache;
@@ -45,12 +47,13 @@ public class ThumbnailManager implements AutoCloseable {
             callback.accept(existing);
             return;
         }
-        if (!inFlight.add(url)) {
+        if (failed.contains(url) || !inFlight.add(url)) {
             return;
         }
         CompletableFuture.supplyAsync(() -> loadImage(url), executor)
                 .thenAcceptAsync(image -> {
                     if (image == null) {
+                        failed.add(url);
                         inFlight.remove(url);
                         return;
                     }
@@ -64,6 +67,7 @@ public class ThumbnailManager implements AutoCloseable {
                     });
                 }, executor)
                 .exceptionally(error -> {
+                    failed.add(url);
                     inFlight.remove(url);
                     return null;
                 });
