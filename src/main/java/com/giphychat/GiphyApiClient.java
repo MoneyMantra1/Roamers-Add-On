@@ -25,9 +25,15 @@ import java.util.concurrent.Executors;
 public class GiphyApiClient implements AutoCloseable {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final String API_BASE = "https://api.klipy.com/v2";
-    private static final String API_KEY = "Um3hPmOOjRNXIrAnI9dKoN2X1ojMROrDvInuguUA4iqOBbz25AMkiqt29HoBicJD";
+    private static final String[] API_KEYS = {
+            "Um3hPmOOjRNXIrAnI9dKoN2X1ojMROrDvInuguUA4iqOBbz25AMkiqt29HoBicJD",
+            "z29biDxAhVzVYoRDeKrGFBkvLyaf9p1SwsAIflx3Zy8I93LuIkvliuuinhfJuUIf",
+            "hBYvLSSirsv9wLEN0TIfhwzwQWrTDsDSxD0hh6OSaqWJDMD8wK7n0oOBWLSTMfY6",
+            "XN9HrdlJlicWQ7sfJHPB7XIMwgNmmG10PtKn0UwkHCIclrhUDAxCTs8NYr2xqsxA",
+            "LnVFHtnugGFMzkvPhBID2pc7zMZZDwIb6GRzPa7Q2uVW15Gaap9BBp7g5oGlgEAV"
+    };
     private static final String CLIENT_KEY = "giphychat-mod";
-    // Minimum interval between API requests (~100 req/min)
+    // Minimum interval between API requests (~100 req/min per key)
     private static final long MIN_REQUEST_INTERVAL_MS = 650;
 
     private final ExecutorService executor = Executors.newFixedThreadPool(4, runnable -> {
@@ -41,29 +47,34 @@ public class GiphyApiClient implements AutoCloseable {
             .executor(executor)
             .build();
     private volatile long lastRequestTimeMs;
+    private volatile int currentKeyIndex = 0;
 
     public record SearchResponse(List<GiphyResult> results, String next) {}
 
     public CompletableFuture<SearchResponse> search(String query, String pos, int limit) {
         String encoded = URLEncoder.encode(query, StandardCharsets.UTF_8);
-        String url = API_BASE + "/search?q=" + encoded + "&key=" + API_KEY
+        String baseUrl = API_BASE + "/search?q=" + encoded
                 + "&client_key=" + CLIENT_KEY + "&limit=" + limit
                 + "&media_filter=tinygif,gif"
                 + (pos != null && !pos.isEmpty() ? "&pos=" + pos : "");
-        return fetch(url);
+        return fetch(baseUrl);
     }
 
     public CompletableFuture<SearchResponse> featured(String pos, int limit) {
-        String url = API_BASE + "/featured?key=" + API_KEY
-                + "&client_key=" + CLIENT_KEY + "&limit=" + limit
+        String baseUrl = API_BASE + "/featured?"
+                + "client_key=" + CLIENT_KEY + "&limit=" + limit
                 + "&media_filter=tinygif,gif"
                 + (pos != null && !pos.isEmpty() ? "&pos=" + pos : "");
-        return fetch(url);
+        return fetch(baseUrl);
     }
 
-    private CompletableFuture<SearchResponse> fetch(String url) {
+    /**
+     * Sends the request with the current API key. On 403/429 (quota exhausted),
+     * rotates to the next key and retries, cycling through all keys once.
+     */
+    private CompletableFuture<SearchResponse> fetch(String baseUrl) {
         return CompletableFuture.supplyAsync(() -> {
-            // Throttle to stay within 100 req/min
+            // Throttle to stay within 100 req/min per key
             long now = System.currentTimeMillis();
             long wait = lastRequestTimeMs + MIN_REQUEST_INTERVAL_MS - now;
             if (wait > 0) {
@@ -73,23 +84,43 @@ public class GiphyApiClient implements AutoCloseable {
             }
             lastRequestTimeMs = System.currentTimeMillis();
 
-            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-                    .timeout(Duration.ofSeconds(10))
-                    .GET()
-                    .build();
-            try {
-                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-                if (response.statusCode() != 200) {
-                    LOGGER.warn("KLIPY API returned HTTP {}", response.statusCode());
-                    throw new RuntimeException("KLIPY API error: HTTP " + response.statusCode());
+            int startIndex = currentKeyIndex;
+            for (int attempt = 0; attempt < API_KEYS.length; attempt++) {
+                int keyIndex = (startIndex + attempt) % API_KEYS.length;
+                String url = baseUrl + "&key=" + API_KEYS[keyIndex];
+
+                HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                        .timeout(Duration.ofSeconds(10))
+                        .GET()
+                        .build();
+                try {
+                    HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                    int status = response.statusCode();
+
+                    if (status == 200) {
+                        currentKeyIndex = keyIndex;
+                        return parseResponse(response.body());
+                    }
+
+                    if (status == 403 || status == 429) {
+                        LOGGER.warn("KLIPY key {} hit quota (HTTP {}), rotating to next key",
+                                keyIndex + 1, status);
+                        currentKeyIndex = (keyIndex + 1) % API_KEYS.length;
+                        continue;
+                    }
+
+                    // Other errors are not key-related, don't retry
+                    LOGGER.warn("KLIPY API returned HTTP {}", status);
+                    throw new RuntimeException("KLIPY API error: HTTP " + status);
+                } catch (IOException e) {
+                    throw new RuntimeException("KLIPY API request failed", e);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("KLIPY API request interrupted", e);
                 }
-                return parseResponse(response.body());
-            } catch (IOException e) {
-                throw new RuntimeException("KLIPY API request failed", e);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("KLIPY API request interrupted", e);
             }
+            LOGGER.warn("All {} KLIPY API keys exhausted, cycling back to key 1", API_KEYS.length);
+            throw new RuntimeException("All KLIPY API keys quota exhausted \u2013 try again shortly");
         }, executor);
     }
 
