@@ -5,6 +5,9 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.resources.ResourceLocation;
 
+import org.slf4j.Logger;
+import com.mojang.logging.LogUtils;
+
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
@@ -22,6 +25,8 @@ import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
 public class ThumbnailManager implements AutoCloseable {
+    private static final Logger LOGGER = LogUtils.getLogger();
+
     private final ExecutorService executor = Executors.newFixedThreadPool(4, runnable -> {
         Thread thread = new Thread(runnable, "GiphyChat-Thumbnails");
         thread.setDaemon(true);
@@ -29,7 +34,7 @@ public class ThumbnailManager implements AutoCloseable {
     });
     private final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
-            .followRedirects(HttpClient.Redirect.NORMAL)
+            .followRedirects(HttpClient.Redirect.ALWAYS)
             .executor(executor)
             .build();
     private final MediaCache cache;
@@ -67,6 +72,7 @@ public class ThumbnailManager implements AutoCloseable {
                     });
                 }, executor)
                 .exceptionally(error -> {
+                    LOGGER.warn("Thumbnail request failed for {}: {}", url, error.getMessage());
                     failed.add(url);
                     inFlight.remove(url);
                     return null;
@@ -80,8 +86,13 @@ public class ThumbnailManager implements AutoCloseable {
             if (bytes == null) {
                 return null;
             }
+            if (isWebP(bytes)) {
+                LOGGER.warn("Thumbnail is WebP (unsupported by NativeImage): {}", url);
+                return null;
+            }
             return NativeImage.read(new ByteArrayInputStream(bytes));
         } catch (IOException e) {
+            LOGGER.warn("Failed to decode thumbnail image from {}: {}", url, e.getMessage());
             return null;
         }
     }
@@ -90,10 +101,13 @@ public class ThumbnailManager implements AutoCloseable {
         try {
             HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                     .timeout(Duration.ofSeconds(10))
+                    .header("Accept", "image/gif, image/png, image/jpeg, */*")
+                    .header("User-Agent", "GiphyChat/1.0")
                     .GET()
                     .build();
             HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
             if (response.statusCode() != 200) {
+                LOGGER.warn("Thumbnail download returned HTTP {} for {}", response.statusCode(), url);
                 return null;
             }
             byte[] bytes = response.body();
@@ -102,8 +116,16 @@ public class ThumbnailManager implements AutoCloseable {
             }
             return bytes;
         } catch (IOException | InterruptedException e) {
+            LOGGER.warn("Thumbnail download failed for {}: {}", url, e.getMessage());
             return null;
         }
+    }
+
+    /** WebP files start with RIFF....WEBP */
+    private static boolean isWebP(byte[] bytes) {
+        return bytes.length >= 12
+                && bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == 'F'
+                && bytes[8] == 'W' && bytes[9] == 'E' && bytes[10] == 'B' && bytes[11] == 'P';
     }
 
     @Override
