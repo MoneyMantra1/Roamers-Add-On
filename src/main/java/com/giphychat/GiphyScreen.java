@@ -134,9 +134,8 @@ public class GiphyScreen extends Screen {
 
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
-        renderBackground(graphics);
-        graphics.drawCenteredString(font, title, width / 2, 4, 0xFFFFFF);
         super.render(graphics, mouseX, mouseY, partialTick);
+        graphics.drawCenteredString(font, title, width / 2, 4, 0xFFFFFF);
 
         int gridTop = TOP_BAR_HEIGHT + 10;
         int gridBottom = height - FOOTER_HEIGHT - 6;
