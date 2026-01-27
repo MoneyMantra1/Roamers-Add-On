@@ -8,9 +8,12 @@ import net.minecraft.resources.ResourceLocation;
 import org.slf4j.Logger;
 import com.mojang.logging.LogUtils;
 
+import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
+import javax.imageio.ImageIO;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -100,21 +103,53 @@ public class ThumbnailManager implements AutoCloseable {
                 return null;
             }
             if (isWebP(bytes)) {
-                LOGGER.warn("Thumbnail is WebP (unsupported by NativeImage): {}", url);
+                LOGGER.warn("Thumbnail is WebP (unsupported): {}", url);
                 return null;
             }
             if (bytes.length < 4) {
                 LOGGER.warn("Thumbnail data too small ({} bytes) for {}", bytes.length, url);
                 return null;
             }
-            LOGGER.debug("Decoding thumbnail: {} bytes, sig={}{}{}{} for {}", bytes.length,
-                    (char) (bytes[0] & 0xFF), (char) (bytes[1] & 0xFF),
-                    (char) (bytes[2] & 0xFF), (char) (bytes[3] & 0xFF), url);
+            // NativeImage.read() only accepts PNG. Convert GIF/JPEG to PNG first.
+            if (!isPng(bytes)) {
+                bytes = convertToPng(bytes);
+                if (bytes == null) {
+                    LOGGER.warn("Failed to convert thumbnail to PNG for {}", url);
+                    return null;
+                }
+            }
             return NativeImage.read(new ByteArrayInputStream(bytes));
         } catch (IOException e) {
             LOGGER.warn("Failed to decode thumbnail image from {}: {}", url, e.getMessage());
             return null;
         }
+    }
+
+    /** Convert any ImageIO-supported format (GIF, JPEG, BMP) to PNG bytes. */
+    private byte[] convertToPng(byte[] imageBytes) {
+        try {
+            BufferedImage img = ImageIO.read(new ByteArrayInputStream(imageBytes));
+            if (img == null) {
+                LOGGER.warn("ImageIO could not read image ({} bytes)", imageBytes.length);
+                return null;
+            }
+            // Ensure ARGB so transparency is preserved
+            BufferedImage argb = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_ARGB);
+            argb.getGraphics().drawImage(img, 0, 0, null);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            ImageIO.write(argb, "PNG", out);
+            return out.toByteArray();
+        } catch (IOException e) {
+            LOGGER.warn("PNG conversion failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private static boolean isPng(byte[] bytes) {
+        // PNG signature: 0x89 P N G
+        return bytes.length >= 4
+                && (bytes[0] & 0xFF) == 0x89
+                && bytes[1] == 'P' && bytes[2] == 'N' && bytes[3] == 'G';
     }
 
     private byte[] download(String url) {
