@@ -20,7 +20,7 @@ import java.util.concurrent.Executors;
 
 public class GiphyApiClient implements AutoCloseable {
     private static final String API_BASE = "https://api.giphy.com/v1/gifs";
-    private static final String GIPHY_API_KEY = "dc6zaTOxFJmzC";
+    private static final String GIPHY_API_KEY = "MMzKroykjR58HsnBVhbhWuFxDrMOtHl4";
 
     private final ExecutorService executor = Executors.newFixedThreadPool(4, runnable -> {
         Thread thread = new Thread(runnable, "GiphyChat-Api");
