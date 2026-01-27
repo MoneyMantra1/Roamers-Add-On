@@ -29,5 +29,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: roamers-addon-jar
+          name: giphy-chat-jar
           path: build/libs/*.jar
