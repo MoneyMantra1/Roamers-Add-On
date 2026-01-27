@@ -1,6 +1,5 @@
 plugins {
     id 'java'
-    id 'net.neoforged.gradle.userdev' version '7.0.120'
 }
 
 java {
@@ -17,6 +16,7 @@ base {
 
 repositories {
     mavenCentral()
+    maven { url = 'https://maven.neoforged.net/releases' }
 }
 
 dependencies {
