@@ -32,10 +32,12 @@ public class ThumbnailManager implements AutoCloseable {
         thread.setDaemon(true);
         return thread;
     });
+    // HttpClient gets its own internal thread pool to avoid deadlock:
+    // if we shared 'executor', all 4 threads could block on send() while
+    // HttpClient needs threads from the same pool for I/O → timeout.
     private final HttpClient client = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
+            .connectTimeout(Duration.ofSeconds(15))
             .followRedirects(HttpClient.Redirect.ALWAYS)
-            .executor(executor)
             .build();
     private final MediaCache cache;
     private final Map<String, ResourceLocation> textures = new ConcurrentHashMap<>();
@@ -116,32 +118,43 @@ public class ThumbnailManager implements AutoCloseable {
     }
 
     private byte[] download(String url) {
-        try {
-            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-                    .timeout(Duration.ofSeconds(10))
-                    .header("Accept", "image/gif, image/png, image/jpeg")
-                    .header("User-Agent", "GiphyChat/1.0")
-                    .GET()
-                    .build();
-            HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
-            String contentType = response.headers().firstValue("Content-Type").orElse("unknown");
-            LOGGER.debug("Thumbnail HTTP {} Content-Type={} size={} for {}",
-                    response.statusCode(), contentType, response.body() != null ? response.body().length : 0, url);
-            if (response.statusCode() != 200) {
-                LOGGER.warn("Thumbnail download returned HTTP {} (Content-Type={}) for {}", response.statusCode(), contentType, url);
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofSeconds(15))
+                .header("Accept", "image/gif, image/png, image/jpeg")
+                .header("User-Agent", "GiphyChat/1.0")
+                .GET()
+                .build();
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            try {
+                HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                String contentType = response.headers().firstValue("Content-Type").orElse("unknown");
+                LOGGER.debug("Thumbnail HTTP {} Content-Type={} size={} for {}",
+                        response.statusCode(), contentType, response.body() != null ? response.body().length : 0, url);
+                if (response.statusCode() != 200) {
+                    LOGGER.warn("Thumbnail download returned HTTP {} (Content-Type={}) for {}", response.statusCode(), contentType, url);
+                    return null;
+                }
+                byte[] bytes = response.body();
+                if (bytes == null || bytes.length == 0) {
+                    LOGGER.warn("Thumbnail download returned empty body for {}", url);
+                    return null;
+                }
+                cache.put(url, bytes);
+                return bytes;
+            } catch (IOException e) {
+                LOGGER.warn("Thumbnail download attempt {}/2 failed for {}: {}", attempt, url, e.getMessage());
+                if (attempt < 2) {
+                    try { Thread.sleep(1000); } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return null;
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 return null;
             }
-            byte[] bytes = response.body();
-            if (bytes == null || bytes.length == 0) {
-                LOGGER.warn("Thumbnail download returned empty body for {}", url);
-                return null;
-            }
-            cache.put(url, bytes);
-            return bytes;
-        } catch (IOException | InterruptedException e) {
-            LOGGER.warn("Thumbnail download failed for {}: {}", url, e.getMessage());
-            return null;
         }
+        return null;
     }
 
     /** WebP files start with RIFF....WEBP */
