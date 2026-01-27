@@ -249,6 +249,13 @@ public class GiphyScreen extends Screen {
         if (cause instanceof ConnectException || cause instanceof UnknownHostException) {
             return Component.translatable("screen.giphychat.status.offline");
         }
+        String msg = cause.getMessage();
+        if (msg != null && msg.contains("429")) {
+            return Component.literal("Rate limited \u2013 try again later");
+        }
+        if (msg != null && !msg.isBlank()) {
+            return Component.literal("Error: " + msg);
+        }
         return Component.translatable("screen.giphychat.status.error");
     }
 

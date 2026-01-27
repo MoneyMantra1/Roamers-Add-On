@@ -5,6 +5,9 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import org.slf4j.Logger;
+import com.mojang.logging.LogUtils;
+
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -19,6 +22,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class GiphyApiClient implements AutoCloseable {
+    private static final Logger LOGGER = LogUtils.getLogger();
     private static final String API_BASE = "https://api.giphy.com/v1/gifs";
     private static final String GIPHY_API_KEY = "dc6zaTOxFJmzC";
 
@@ -29,6 +33,7 @@ public class GiphyApiClient implements AutoCloseable {
     });
     private final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
+            .followRedirects(HttpClient.Redirect.NORMAL)
             .executor(executor)
             .build();
 
@@ -52,7 +57,8 @@ public class GiphyApiClient implements AutoCloseable {
         return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                 .thenApplyAsync(response -> {
                     if (response.statusCode() != 200) {
-                        throw new RuntimeException("GIPHY API error: " + response.statusCode());
+                        LOGGER.warn("GIPHY API returned HTTP {}", response.statusCode());
+                        throw new RuntimeException("GIPHY API error: HTTP " + response.statusCode());
                     }
                     return parseResults(response.body());
                 }, executor);
