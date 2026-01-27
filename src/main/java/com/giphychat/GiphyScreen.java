@@ -39,13 +39,13 @@ public class GiphyScreen extends Screen {
     private Component statusText = Component.translatable("screen.giphychat.status.ready");
     private Mode mode = Mode.SEARCH;
     private String currentQuery = "";
-    private int offset = 0;
+    private String nextPos = "";
     private boolean hasMore = true;
     private boolean loading = false;
     private int scrollOffset = 0;
     private int maxScroll = 0;
     private int requestToken = 0;
-    private CompletableFuture<List<GiphyResult>> currentRequest;
+    private CompletableFuture<GiphyApiClient.SearchResponse> currentRequest;
 
     public GiphyScreen() {
         super(Component.translatable("screen.giphychat.title"));
@@ -182,7 +182,7 @@ public class GiphyScreen extends Screen {
         }
         mode = Mode.SEARCH;
         currentQuery = query;
-        offset = 0;
+        nextPos = "";
         results.clear();
         scrollOffset = 0;
         hasMore = true;
@@ -192,7 +192,7 @@ public class GiphyScreen extends Screen {
     private void startTrending() {
         mode = Mode.TRENDING;
         currentQuery = "";
-        offset = 0;
+        nextPos = "";
         results.clear();
         scrollOffset = 0;
         hasMore = true;
@@ -201,7 +201,6 @@ public class GiphyScreen extends Screen {
 
     private void loadMore() {
         if (!loading && hasMore) {
-            offset += LIMIT;
             fetchResults();
         }
     }
@@ -217,9 +216,9 @@ public class GiphyScreen extends Screen {
             currentRequest.cancel(true);
         }
         if (mode == Mode.SEARCH) {
-            currentRequest = apiClient.search(currentQuery, offset, LIMIT);
+            currentRequest = apiClient.search(currentQuery, nextPos, LIMIT);
         } else {
-            currentRequest = apiClient.trending(offset, LIMIT);
+            currentRequest = apiClient.featured(nextPos, LIMIT);
         }
         currentRequest.whenComplete((response, throwable) -> Minecraft.getInstance().execute(() -> {
             if (token != requestToken) {
@@ -231,8 +230,9 @@ public class GiphyScreen extends Screen {
                 return;
             }
             if (response != null) {
-                results.addAll(response);
-                if (response.size() < LIMIT) {
+                results.addAll(response.results());
+                nextPos = response.next();
+                if (nextPos.isEmpty() || response.results().size() < LIMIT) {
                     hasMore = false;
                 }
             }

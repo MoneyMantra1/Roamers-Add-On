@@ -1,7 +1,7 @@
 {
-  "key.giphychat.open": "Open GIPHY",
+  "key.giphychat.open": "Open GIFs",
   "key.categories.giphychat": "GiphyChat",
-  "screen.giphychat.title": "GIPHY",
+  "screen.giphychat.title": "GIFs",
   "screen.giphychat.search": "Search",
   "screen.giphychat.trending": "Trending",
   "screen.giphychat.status.searching": "Searching...",
@@ -9,5 +9,5 @@
   "screen.giphychat.status.error": "Error",
   "screen.giphychat.status.ready": "Ready",
   "screen.giphychat.status.offline": "Offline",
-  "screen.giphychat.powered": "Powered by GIPHY"
+  "screen.giphychat.powered": "Powered by KLIPY"
 }
